@@ -1,102 +1,135 @@
 import os
+import time
+
 from flask import Flask, request, jsonify
-from openai import OpenAI, OpenAIError
+from openai import OpenAI
 
-app = Flask(__name__)
-
-# OpenAI client
+# Create OpenAI client – uses OPENAI_API_KEY from the environment
 client = OpenAI()
 
-# Your Walter assistant id from the OpenAI UI
-ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "").strip()
+# Your Assistant ID should be set as an environment variable in Railway
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
-
-@app.route("/", methods=["GET"])
-def health():
-    """Simple health check."""
-    return "Walter webhook is running.", 200
+app = Flask(__name__)
 
 
 @app.route("/walter", methods=["POST"])
 def walter():
+    """
+    Webhook endpoint called by Zoho SalesIQ.
+    Expects JSON: {"question": "..."}
+    Returns JSON: {"answer": "..."}
+    """
     try:
-        # Get the question from Zoho
-        data = request.get_json(silent=True) or {}
+        data = request.get_json(force=True) or {}
         question = (data.get("question") or "").strip()
 
         if not question:
-            # Nothing useful sent in, reply gracefully
-            return jsonify({
-                "answer": "I didn’t receive a question to answer."
-            }), 200
+            return (
+                jsonify(
+                    {
+                        "answer": "I didn’t receive a question to answer. "
+                        "Please try asking again."
+                    }
+                ),
+                400,
+            )
 
         if not ASSISTANT_ID:
-            # We can't call the assistant without its id
-            print("ERROR: OPENAI_ASSISTANT_ID is not set")
-            return jsonify({
-                "answer": "My configuration is incomplete (assistant id missing)."
-            }), 200
+            # Fail fast if the assistant id isn't configured
+            return (
+                jsonify(
+                    {
+                        "answer": "Walter is not fully configured yet "
+                        "(missing ASSISTANT_ID)."
+                    }
+                ),
+                500,
+            )
 
-        # 1) Create a thread with the user's message
+        # 1) Create a thread with the user’s question
         thread = client.beta.threads.create(
-            messages=[{
-                "role": "user",
-                "content": question
-            }]
+            messages=[
+                {
+                    "role": "user",
+                    "content": question,
+                }
+            ]
         )
 
-        # 2) Run the assistant on that thread
-        run = client.beta.threads.runs.create_and_poll(
+        # 2) Start a run with your Assistant
+        run = client.beta.threads.runs.create(
             thread_id=thread.id,
             assistant_id=ASSISTANT_ID,
         )
 
-        if run.status != "completed":
-            # Assistant didn't complete for some reason
-            print(f"Run status not completed: {run.status}")
-            return jsonify({
-                "answer": "I ran into a problem while answering that. Please try again."
-            }), 200
+        # 3) Poll until the run finishes or times out
+        for _ in range(30):  # up to ~30 seconds
+            run_status = client.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id,
+            )
 
-        # 3) Fetch messages from the thread and extract assistant text
+            status = run_status.status
+            if status == "completed":
+                break
+            if status in ("failed", "cancelled", "expired"):
+                return (
+                    jsonify(
+                        {
+                            "answer": "Sorry, I couldn’t process that request right now."
+                        }
+                    ),
+                    500,
+                )
+
+            time.sleep(1)
+
+        # 4) Retrieve the messages on the thread and extract the assistant’s reply
         messages = client.beta.threads.messages.list(thread_id=thread.id)
 
-        answer_chunks = []
-        for m in messages.data:
-            if m.role == "assistant":
-                for c in m.content:
-                    if c.type == "text":
-                        answer_chunks.append(c.text.value)
+        answer_text = ""
+        for msg in messages.data:
+            if msg.role == "assistant":
+                # msg.content is a list of content blocks
+                for block in msg.content:
+                    # text blocks have .type == "text"
+                    if getattr(block, "type", None) == "text":
+                        answer_text += block.text.value
+                if answer_text:
+                    break
 
-        # Assistant messages are returned newest-first; reverse to get the latest as last
-        answer_chunks = list(reversed(answer_chunks))
-
-        if not answer_chunks:
+        if not answer_text:
             answer_text = (
-                "I couldn’t find a specific answer to that in my knowledge base."
+                "Sorry, I couldn’t find an answer for that, "
+                "but a human can help you if you connect with support."
             )
-        else:
-            answer_text = "\n".join(answer_chunks)
 
-        return jsonify({"answer": answer_text}), 200
-
-    except OpenAIError as e:
-        # Errors from OpenAI client itself
-        print("OpenAI error in /walter:", repr(e))
-        return jsonify({
-            "answer": "I’m having trouble talking to my knowledge base right now."
-        }), 200
+        return jsonify({"answer": answer_text})
 
     except Exception as e:
-        # Anything else unexpected
-        print("Unexpected error in /walter:", repr(e))
-        return jsonify({
-            "answer": "I hit an unexpected error while answering that."
-        }), 200
+        # Log to stdout so Railway logs show the error, but don’t leak details to the user
+        print("Error in /walter endpoint:", repr(e))
+        return (
+            jsonify(
+                {
+                    "answer": "Sorry, something went wrong while talking to Walter. "
+                    "Please try again in a moment."
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/", methods=["GET"])
+def healthcheck():
+    """Simple health check endpoint."""
+    return "Walter webhook is running.", 200
 
 
 if __name__ == "__main__":
-    # For local testing only. Railway will use its own web server.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)), debug=True)
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
