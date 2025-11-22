@@ -1,108 +1,135 @@
 import os
+import time
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
 app = Flask(__name__)
 
-# ---- OpenAI client & Assistant ----
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-ASSISTANT_ID = os.getenv("ASSISTANT_ID")
+# -------------------------------------------------------------------
+# OpenAI / Walter configuration
+# -------------------------------------------------------------------
+# Either keep your existing ASSISTANT_ID line here,
+# or edit this value to your real assistant id.
+ASSISTANT_ID = os.getenv("ASSISTANT_ID", "YOUR_ASSISTANT_ID_HERE")
+
+client = OpenAI()  # uses OPENAI_API_KEY env var
 
 
-@app.route("/", methods=["GET"])
-def health_check():
-    return "OK", 200
+# -------------------------------------------------------------------
+# Helper: send question to Walter and get answer
+# -------------------------------------------------------------------
+def ask_walter(question: str) -> str:
+    """
+    Send the user's question to the Walter assistant and return the answer text.
+    """
 
-
-@app.route("/walter", methods=["POST"])
-def walter():
-    # Safely parse JSON body
-    data = request.get_json(silent=True)
-
-    # 🔍 DEBUG: log whatever SalesIQ is sending
-    print("\n----------------------------")
-    print("RAW REQUEST FROM SALESIQ:")
-    print(data)
-    print("----------------------------\n")
-
-    # If nothing came in at all
-    if not data:
-        return jsonify({
-            "answer": "I didn’t receive a question to answer. Please type your question and send it again."
-        })
-
-    # Try multiple possible field names, but we expect `visitor_question`
-    question = (
-        data.get("visitor_question")
-        or data.get("visitor.question")
-        or data.get("question")
+    # Create a fresh thread for this question
+    thread = client.beta.threads.create(
+        messages=[
+            {
+                "role": "user",
+                "content": question,
+            }
+        ]
     )
 
-    # If the question field is missing or empty
-    if not question or not str(question).strip():
-        return jsonify({
-            "answer": "I didn’t receive a question to answer. Please type your question and send it again."
-        })
+    # Kick off a run for your assistant
+    run = client.beta.threads.runs.create(
+        thread_id=thread.id,
+        assistant_id=ASSISTANT_ID,
+    )
 
-    question = str(question).strip()
+    # Poll until the run completes (or fails)
+    while True:
+        run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
 
+        if run.status == "completed":
+            break
+        if run.status in ("failed", "cancelled", "expired"):
+            app.logger.error("Walter run ended with status: %s", run.status)
+            return "I'm having trouble answering right now. Please try again or contact Intoxalock support."
+
+        time.sleep(0.5)
+
+    # Get the newest assistant message
+    messages = client.beta.threads.messages.list(thread_id=thread.id, limit=1)
+
+    if not messages.data:
+        app.logger.error("No messages returned from Walter.")
+        return "I couldn't generate an answer. Please try again or contact Intoxalock support."
+
+    msg = messages.data[0]
+
+    # Extract plain text from the message content
+    parts = msg.content
+    text_chunks = []
+    for part in parts:
+        if getattr(part, "type", None) == "text":
+            text_chunks.append(part.text.value)
+    if not text_chunks:
+        return "I couldn't generate an answer. Please try again or contact Intoxalock support."
+
+    return "\n".join(text_chunks).strip()
+
+
+# -------------------------------------------------------------------
+# Webhook endpoint for Zoho SalesIQ
+# -------------------------------------------------------------------
+@app.route("/walter", methods=["POST", "GET"])
+def walter_webhook():
     try:
-        # Create a thread seeded with the user's question
-        thread = client.beta.threads.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": question,
-                }
-            ]
+        # --- Inspect everything SalesIQ sends ------------------------
+        raw_json = request.get_json(silent=True) or {}
+        args = request.args.to_dict()
+        form = request.form.to_dict()
+
+        app.logger.info("Incoming request args: %s", args)
+        app.logger.info("Incoming request form: %s", form)
+        app.logger.info("Incoming request JSON: %s", raw_json)
+
+        # --- Try to find the visitor question ------------------------
+        question = (
+            args.get("question")
+            or form.get("question")
+            or raw_json.get("question")
+            or raw_json.get("visitor_question")
+            or raw_json.get("visitor.question")
         )
 
-        # Run the Assistant and wait for completion
-        run = client.beta.threads.runs.create_and_poll(
-            thread_id=thread.id,
-            assistant_id=ASSISTANT_ID,
-        )
+        app.logger.info("Extracted question: %r", question)
 
-        if run.status != "completed":
-            print("Run did not complete normally:", run.status)
-            return jsonify({
-                "answer": "I had trouble answering that just now. Please try again in a moment."
-            })
-
-        # Get the latest message from the thread (Assistant's reply)
-        messages = client.beta.threads.messages.list(
-            thread_id=thread.id,
-            order="desc",
-            limit=1,
-        )
-
-        answer_text = ""
-
-        if messages.data:
-            msg = messages.data[0]
-            for part in msg.content:
-                # Text parts (ignore images / other content types)
-                if getattr(part, "type", None) == "text":
-                    answer_text += part.text.value
-
-        if not answer_text.strip():
-            answer_text = (
-                "I’m not sure how to answer that yet. "
-                "Please reach out to Intoxalock support for help."
+        if not question or not str(question).strip():
+            # We *always* return 200 so SalesIQ doesn't show "insufficient data".
+            answer = (
+                "I didn’t receive a clear question to answer. "
+                "Please type your Intoxalock service center question again."
             )
+            return jsonify({"answer": answer}), 200
 
-        return jsonify({"answer": answer_text})
+        # --- Ask Walter via OpenAI -----------------------------------
+        answer = ask_walter(question)
+
+        # Return in the shape SalesIQ expects: { "answer": "..." }
+        return jsonify({"answer": answer}), 200
 
     except Exception as e:
-        # Log server-side error for debugging
-        print("Error talking to OpenAI:", repr(e))
-        return jsonify({
-            "answer": "I ran into an error while answering that. "
-                      "Please try again or contact the Intoxalock team."
-        }), 500
+        # Log the error but still return a friendly message with 200
+        app.logger.exception("Error handling /walter webhook: %s", e)
+        fallback = (
+            "I ran into a problem answering that right now. "
+            "Please try again in a moment or contact Intoxalock support."
+        )
+        return jsonify({"answer": fallback}), 200
+
+
+# -------------------------------------------------------------------
+# Simple health check
+# -------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def health():
+    return "Walter webhook is running.", 200
 
 
 if __name__ == "__main__":
-    # Railway usually injects PORT; default to 8080 if not
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    # For local testing only; Railway will use gunicorn or similar.
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
