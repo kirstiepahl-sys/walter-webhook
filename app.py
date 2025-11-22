@@ -68,7 +68,7 @@ def call_openai_walter(user_question: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # --- ONLY CHANGE: richer system prompt with wiring + microsite rules -----
+    # --- system prompt with microsite + wiring rules ---
     system_prompt = """
 You are Walter, Intoxalock's friendly internal assistant for service centers.
 
@@ -154,11 +154,27 @@ CONVERSATION & CLARIFICATION
     try:
         response_json = resp.json()
         logging.info("Raw OpenAI response: %s", response_json)
-        answer = response_json["output"][0]["content"][0]["text"]["value"]
-        answer = answer.strip()
+
+        answer = None
+
+        # ✅ NEW: use the convenience field first if present
+        if isinstance(response_json.get("output_text"), dict):
+            answer = response_json["output_text"].get("content")
+
+        # Fallback to the older, nested way if needed
+        if not answer:
+            answer = (
+                response_json["output"][0]["content"][0]["text"]["value"]
+            )
+
+        if answer:
+            answer = answer.strip()
+
         if not answer:
             raise ValueError("Empty answer from Walter")
+
         return answer
+
     except Exception as e:
         logging.exception("Error parsing OpenAI response: %s", e)
         return "Walter was not able to find an answer this time. Please try again."
