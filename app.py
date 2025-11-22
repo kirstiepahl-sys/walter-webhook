@@ -68,7 +68,7 @@ def call_openai_walter(user_question: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # --- system prompt with microsite + wiring rules ---
+    # System prompt with microsite + wiring rules
     system_prompt = """
 You are Walter, Intoxalock's friendly internal assistant for service centers.
 
@@ -157,15 +157,13 @@ CONVERSATION & CLARIFICATION
 
         answer = None
 
-        # ✅ NEW: use the convenience field first if present
+        # Try convenience field first if present
         if isinstance(response_json.get("output_text"), dict):
             answer = response_json["output_text"].get("content")
 
-        # Fallback to the older, nested way if needed
+        # Fallback to older nested structure
         if not answer:
-            answer = (
-                response_json["output"][0]["content"][0]["text"]["value"]
-            )
+            answer = response_json["output"][0]["content"][0]["text"]["value"]
 
         if answer:
             answer = answer.strip()
@@ -184,7 +182,7 @@ CONVERSATION & CLARIFICATION
 def walter():
     """
     Main endpoint: accept a JSON payload from Zoho
-    and return an answer from Walter as JSON.
+    and return Walter's answer as JSON.
     """
     payload = request.get_json(force=True) or {}
     logging.info("Incoming payload: %s", payload)
@@ -194,17 +192,22 @@ def walter():
     if not question:
         logging.info("No question found in request; returning fallback answer.")
         return jsonify({
-            "answer": "I didn’t receive a question to answer. Please type your Intoxalock service center question again."
+            "answer": "I didn't receive a question to answer. Please type your question in and try again."
         })
 
     logging.info("Question extracted: %s", question)
 
     try:
-        answer = call_openai_walter(question)
+        # 🔧 TEMP: BYPASS OPENAI so we can confirm end-to-end wiring
+        answer = f'DEBUG: Walter webhook is working. I received: "{question}".'
+
+        # Once we confirm this shows up in SalesIQ, we will switch back to:
+        # answer = call_openai_walter(question)
+
     except Exception as e:
-        logging.exception("Unexpected error getting Walter answer: %s", e)
+        logging.exception("Error (even in debug mode): %s", e)
         answer = (
-            "I’m sorry, I ran into a problem talking to Walter. "
+            "I ran into a problem in the Walter webhook. "
             "Please connect with a human so we can help you."
         )
 
@@ -214,3 +217,4 @@ def walter():
 if __name__ == "__main__":
     # For local testing, run the app
     app.run(host="0.0.0.0", port=8081)
+
