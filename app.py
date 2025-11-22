@@ -104,17 +104,29 @@ def walter():
     data = request.get_json(silent=True) or {}
     logging.info("Incoming /walter payload: %s", data)
 
-    # Support both "question" and "visitor_question" just in case.
-    question = data.get("question") or data.get("visitor_question")
+    # Try multiple common keys from SalesIQ / webhooks, not just "question".
+    raw_question = (
+        data.get("question")
+        or data.get("visitor_question")
+        or data.get("input")
+        or data.get("input_text")
+        or data.get("message")
+        or data.get("text")
+        or ""
+    )
 
-    if not isinstance(question, str) or not question.strip():
-        logging.warning("No question found in payload.")
+    # Sometimes the payload can nest text in a dict; handle that gracefully.
+    if isinstance(raw_question, dict):
+        raw_question = raw_question.get("text") or ""
+
+    question = str(raw_question).strip()
+    logging.info("Resolved question string: %r", question)
+
+    if not question:
+        logging.warning("No usable question found in payload; sending failsafe.")
         return jsonify({
             "answer": "I didn’t receive a question to answer. Please type your Intoxalock service center question again."
         })
-
-    question = question.strip()
-    logging.info("User question: %s", question)
 
     # Build the input for the Responses API
     prompt = [
@@ -165,3 +177,4 @@ def walter():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
+
