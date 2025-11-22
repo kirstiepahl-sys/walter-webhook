@@ -8,15 +8,17 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# OpenAI key from env
 OPENAI_API_KEY = os.getenv("INTX_OPENAI_API_KEY")
 
 
 def extract_question(payload) -> str:
     """
     Try several ways to pull a 'question' out of the incoming request.
+    This matches the style of your last working version.
     """
 
-    # 1) If SalesIQ style: {"question": "..."}
+    # 1) Direct: {"question": "..."}
     if "question" in payload:
         q = payload["question"]
         if isinstance(q, str) and q.strip() != "":
@@ -32,13 +34,13 @@ def extract_question(payload) -> str:
     except Exception as e:
         logging.info(f"Data parse failed: {e}")
 
-    # 3) Fallback from 'input'
+    # 3) From 'input'
     if "input" in payload:
         maybe = payload["input"]
         if isinstance(maybe, str) and maybe.strip() != "":
             return maybe.strip()
 
-    # 4) From 'visitor' key (some SalesIQ keys live in 'visitor' JSON)
+    # 4) From 'visitor'
     try:
         visitor = payload.get("visitor") or {}
         if isinstance(visitor, dict):
@@ -48,7 +50,7 @@ def extract_question(payload) -> str:
     except Exception as e:
         logging.info(f"Visitor parse failed: {e}")
 
-    # If we can't parse, just return empty text
+    # If we can't parse, return empty
     return ""
 
 
@@ -56,6 +58,7 @@ def call_openai_walter(user_question: str) -> str:
     """
     Send the user's question into Walter via OpenAI.
     """
+
     if not OPENAI_API_KEY:
         logging.error("INTX_OPENAI_API_KEY not set; cannot call OpenAI.")
         return (
@@ -161,7 +164,7 @@ CONVERSATION & CLARIFICATION
         if isinstance(response_json.get("output_text"), dict):
             answer = response_json["output_text"].get("content")
 
-        # Fallback to older nested structure
+        # Fallback to nested structure
         if not answer:
             answer = response_json["output"][0]["content"][0]["text"]["value"]
 
@@ -191,7 +194,6 @@ def walter():
 
     if not question:
         logging.info("No question found in request; returning fallback answer.")
-        # Make sure there's always *some* text in all the common keys
         msg = (
             "I didn't receive a question to answer. "
             "Please type your question in and try again."
@@ -200,6 +202,11 @@ def walter():
             "answer": msg,
             "message": msg,
             "text": msg,
+            "data": {
+                "answer": msg,
+                "message": msg,
+                "text": msg,
+            },
         })
 
     logging.info("Question extracted: %s", question)
@@ -213,14 +220,19 @@ def walter():
             "Please connect with a human so we can help you."
         )
 
-    # 🔑 Return the same content under several keys so any mapping still works
+    # Return answer in several common fields so SalesIQ can map any of them
     return jsonify({
         "answer": answer,
         "message": answer,
         "text": answer,
+        "data": {
+            "answer": answer,
+            "message": answer,
+            "text": answer,
+        },
     })
 
 
 if __name__ == "__main__":
-    # For local testing, run the app
+    # For local testing
     app.run(host="0.0.0.0", port=8081)
