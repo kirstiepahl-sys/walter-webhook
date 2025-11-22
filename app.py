@@ -1,201 +1,108 @@
 import os
-import json
-import logging
-
 from flask import Flask, request, jsonify
-import requests
+from openai import OpenAI
 
 app = Flask(__name__)
 
-# --- logging -----------------------------------------------------------
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- config ------------------------------------------------------------
-
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ASSISTANT_ID = os.environ.get("ASSISTANT_ID")  # set this in Railway variables
-
-OPENAI_API_BASE = "https://api.openai.com/v1"
+# ---- OpenAI client & Assistant ----
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+ASSISTANT_ID = os.getenv("ASSISTANT_ID")
 
 
-# --- helpers -----------------------------------------------------------
+@app.route("/", methods=["GET"])
+def health_check():
+    return "OK", 200
 
-def extract_question(req) -> str:
-    """
-    Try very hard to extract the user's question from the incoming request.
-
-    We support:
-    - JSON body
-    - form-encoded body
-    - raw body containing JSON
-    - query parameter ?question=
-    And multiple field names: question / visitor.question / visitor_question.
-    """
-
-    payload = {}
-
-    # 1) JSON body
-    try:
-        if req.is_json:
-            payload = req.get_json(silent=True) or {}
-    except Exception as e:
-        logger.exception("Error parsing JSON body: %s", e)
-
-    # 2) form-encoded body
-    if not payload:
-        try:
-            form_data = req.form.to_dict()
-            if form_data:
-                payload = form_data
-        except Exception as e:
-            logger.exception("Error reading form body: %s", e)
-
-    # 3) raw body (might be JSON string)
-    if not payload:
-        raw = req.get_data(cache=False, as_text=True) or ""
-        if raw.strip():
-            try:
-                payload = json.loads(raw)
-            except Exception:
-                # not JSON; just log for debugging
-                logger.info("Raw body (non-JSON): %r", raw)
-
-    logger.info("Incoming payload after parsing: %s", payload)
-
-    # 4) finally, querystring
-    question = (
-        payload.get("question")
-        or payload.get("visitor.question")
-        or payload.get("visitor_question")
-        or payload.get("text")
-        or req.args.get("question")
-        or ""
-    )
-
-    if question is None:
-        question = ""
-
-    question = str(question).strip()
-    logger.info("Extracted question: %r", question)
-    return question
-
-
-def call_openai_assistant(question: str) -> str:
-    """
-    Call your OpenAI Assistant (with vector store attached) via the Responses API.
-    """
-
-    if not OPENAI_API_KEY:
-        logger.error("OPENAI_API_KEY is not set")
-        return (
-            "I’m having trouble accessing my knowledge right now because my API key "
-            "is missing. Please contact Intoxalock support for help."
-        )
-
-    if not ASSISTANT_ID:
-        logger.error("ASSISTANT_ID is not set")
-        return (
-            "I’m not fully configured yet (missing assistant ID). "
-            "Please contact Intoxalock support so we can fix this."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-        "OpenAI-Beta": "assistants=v2",
-    }
-
-    body = {
-        "model": "gpt-4.1-mini",
-        "assistant_id": ASSISTANT_ID,
-        "input": [
-            {
-                "role": "user",
-                "content": question,
-            }
-        ],
-        # System / style instructions live on the Assistant itself in the UI.
-        # If you ever want to add *extra* one-off instructions, you can use:
-        # "metadata" or an additional "input" message with role "assistant".
-    }
-
-    try:
-        resp = requests.post(
-            f"{OPENAI_API_BASE}/responses",
-            headers=headers,
-            json=body,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        logger.info("OpenAI response JSON: %s", json.dumps(data, indent=2))
-
-        # Prefer the convenience field if present
-        answer_text = None
-
-        # Newer Responses API sometimes includes `output_text`
-        if isinstance(data, dict) and "output_text" in data:
-            ot = data["output_text"]
-            if isinstance(ot, dict):
-                choices = ot.get("choices") or []
-                if choices:
-                    answer_text = choices[0].get("text")
-
-        # Fallback: walk the `output` list
-        if not answer_text:
-            output = data.get("output") or []
-            texts = []
-            for item in output:
-                # each item has "content": [{"type": "output_text", "text": {...}}]
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text":
-                        text_obj = c.get("text") or {}
-                        parts = text_obj.get("value") or ""
-                        texts.append(parts)
-            if texts:
-                answer_text = "\n".join(texts)
-
-        if not answer_text:
-            logger.error("Could not extract answer text from OpenAI response")
-            return (
-                "I wasn’t able to read the answer from my knowledge base. "
-                "Please reach out to Intoxalock support for assistance."
-            )
-
-        return answer_text.strip()
-
-    except Exception as e:
-        logger.exception("Error talking to OpenAI: %s", e)
-        return (
-            "I’m having trouble reaching my knowledge base right now. "
-            "Please contact Intoxalock support or try again in a few minutes."
-        )
-
-
-# --- routes ------------------------------------------------------------
 
 @app.route("/walter", methods=["POST"])
 def walter():
-    question = extract_question(request)
+    # Safely parse JSON body
+    data = request.get_json(silent=True)
 
-    if not question:
-        logger.info("No question found in request; sending default message.")
-        return jsonify(
-            {
-                "answer": "I didn’t receive a question to answer. "
-                          "Please type your question and send it again."
-            }
+    # 🔍 DEBUG: log whatever SalesIQ is sending
+    print("\n----------------------------")
+    print("RAW REQUEST FROM SALESIQ:")
+    print(data)
+    print("----------------------------\n")
+
+    # If nothing came in at all
+    if not data:
+        return jsonify({
+            "answer": "I didn’t receive a question to answer. Please type your question and send it again."
+        })
+
+    # Try multiple possible field names, but we expect `visitor_question`
+    question = (
+        data.get("visitor_question")
+        or data.get("visitor.question")
+        or data.get("question")
+    )
+
+    # If the question field is missing or empty
+    if not question or not str(question).strip():
+        return jsonify({
+            "answer": "I didn’t receive a question to answer. Please type your question and send it again."
+        })
+
+    question = str(question).strip()
+
+    try:
+        # Create a thread seeded with the user's question
+        thread = client.beta.threads.create(
+            messages=[
+                {
+                    "role": "user",
+                    "content": question,
+                }
+            ]
         )
 
-    answer = call_openai_assistant(question)
-    return jsonify({"answer": answer})
+        # Run the Assistant and wait for completion
+        run = client.beta.threads.runs.create_and_poll(
+            thread_id=thread.id,
+            assistant_id=ASSISTANT_ID,
+        )
 
+        if run.status != "completed":
+            print("Run did not complete normally:", run.status)
+            return jsonify({
+                "answer": "I had trouble answering that just now. Please try again in a moment."
+            })
 
-# --- main --------------------------------------------------------------
+        # Get the latest message from the thread (Assistant's reply)
+        messages = client.beta.threads.messages.list(
+            thread_id=thread.id,
+            order="desc",
+            limit=1,
+        )
+
+        answer_text = ""
+
+        if messages.data:
+            msg = messages.data[0]
+            for part in msg.content:
+                # Text parts (ignore images / other content types)
+                if getattr(part, "type", None) == "text":
+                    answer_text += part.text.value
+
+        if not answer_text.strip():
+            answer_text = (
+                "I’m not sure how to answer that yet. "
+                "Please reach out to Intoxalock support for help."
+            )
+
+        return jsonify({"answer": answer_text})
+
+    except Exception as e:
+        # Log server-side error for debugging
+        print("Error talking to OpenAI:", repr(e))
+        return jsonify({
+            "answer": "I ran into an error while answering that. "
+                      "Please try again or contact the Intoxalock team."
+        }), 500
+
 
 if __name__ == "__main__":
-    # Railway sets PORT; default to 8080 for local tests
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Railway usually injects PORT; default to 8080 if not
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
