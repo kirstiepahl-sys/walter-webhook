@@ -104,7 +104,7 @@ def walter():
     data = request.get_json(silent=True) or {}
     logging.info("Incoming /walter payload: %s", data)
 
-    # Try multiple common keys from SalesIQ / webhooks, not just "question".
+    # --- MINIMAL CHANGE: make question extraction tolerant, never early-return ---
     raw_question = (
         data.get("question")
         or data.get("visitor_question")
@@ -115,18 +115,21 @@ def walter():
         or ""
     )
 
-    # Sometimes the payload can nest text in a dict; handle that gracefully.
+    # If some integrations nest the text inside an object, try to pull it out.
     if isinstance(raw_question, dict):
         raw_question = raw_question.get("text") or ""
 
     question = str(raw_question).strip()
     logging.info("Resolved question string: %r", question)
 
+    # If we still don't have anything, let the *model* handle the failsafe message.
     if not question:
-        logging.warning("No usable question found in payload; sending failsafe.")
-        return jsonify({
-            "answer": "I didn’t receive a question to answer. Please type your Intoxalock service center question again."
-        })
+        logging.warning("No usable question found in payload; delegating to model.")
+        question = (
+            "The system did not capture any visible text from the user's last "
+            "message. Please politely ask them to type their Intoxalock service "
+            "center question again so you can help."
+        )
 
     # Build the input for the Responses API
     prompt = [
