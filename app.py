@@ -1,104 +1,146 @@
 import os
+import json
+import time
+import urllib.parse
+
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
-# Create OpenAI client – no custom httpx / proxies, just env var
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY")
-)
-
-# Your existing Assistant ID from the OpenAI dashboard
-ASSISTANT_ID = "YOUR_ASSISTANT_ID_HERE"
-
 app = Flask(__name__)
+
+# Init OpenAI client
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Your existing Walter assistant ID
+ASSISTANT_ID = "asst_Ou8BA8URF4u293zQ9twUKEzt"
+
+
+def extract_question(req):
+    """
+    Try very hard to get a 'question' string from the Zoho SalesIQ webhook.
+    We support:
+      - JSON body: {"question": "..."} or {"Question": "..."}
+      - Form body: question=...
+      - URL-encoded body: question=...
+      - Query string: ?question=...
+    """
+    raw_body = req.get_data(as_text=True) or ""
+    print("Raw request body:", raw_body)
+    print("Headers:", dict(req.headers))
+
+    question = None
+
+    # 1) Try standard JSON
+    try:
+        data = req.get_json(force=False, silent=True)
+        if isinstance(data, dict):
+            print("Parsed JSON body:", data)
+            question = data.get("question") or data.get("Question")
+    except Exception as e:
+        print("Error parsing JSON body:", e)
+
+    # 2) Try form fields (application/x-www-form-urlencoded)
+    if not question:
+        if req.form:
+            print("Parsed form data:", req.form)
+            question = req.form.get("question") or req.form.get("Question")
+
+    # 3) Try query string
+    if not question:
+        if req.args:
+            print("Parsed query args:", req.args)
+            question = req.args.get("question") or req.args.get("Question")
+
+    # 4) Try to manually parse URL-encoded body
+    if not question and raw_body:
+        try:
+            parsed_qs = urllib.parse.parse_qs(raw_body)
+            print("Parsed URL-encoded body:", parsed_qs)
+            for key in ("question", "Question"):
+                if key in parsed_qs and parsed_qs[key]:
+                    question = parsed_qs[key][0]
+                    break
+        except Exception as e:
+            print("Error parsing URL-encoded body:", e)
+
+    if question:
+        question = question.strip()
+
+    return question
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return "Walter webhook is alive", 200
 
 
 @app.route("/walter", methods=["POST"])
 def walter():
-    """
-    Webhook endpoint that SalesIQ calls.
+    # Try to extract the visitor's question from the incoming request
+    question = extract_question(request)
 
-    Expects JSON body like:
-        { "question": "How do I log in to the microsite?" }
+    if not question:
+        # Log and return a friendly message – this is what you were seeing
+        print("No question found in request; returning fallback answer.")
+        return jsonify({"answer": "I didn’t receive a question to answer."})
 
-    Returns:
-        { "answer": "..." }
-    """
+    print(f"User question: {question!r}")
+
     try:
-        # Safely parse JSON
-        data = request.get_json(silent=True) or {}
-        question = (data.get("question") or "").strip()
-
-        if not question:
-            # SalesIQ will see this and you’ll also no longer get
-            # “insufficient data” for truly empty payloads.
-            return jsonify({
-                "answer": "I didn’t receive a question to answer."
-            }), 200
-
-        # 1) Create a thread with the user's question
+        # Create a new thread with the user's question
         thread = client.beta.threads.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": question
-                }
-            ]
+            messages=[{"role": "user", "content": question}]
         )
 
-        # 2) Run the assistant and wait for completion
-        run = client.beta.threads.runs.create_and_poll(
+        # Kick off a run for the assistant
+        run = client.beta.threads.runs.create(
             thread_id=thread.id,
             assistant_id=ASSISTANT_ID,
-            # optional: tweak style a bit
-            temperature=0.4,
         )
 
-        if run.status != "completed":
-            # The run didn’t finish successfully; don’t crash
-            return jsonify({
-                "answer": "I wasn’t able to generate a response just now. "
-                          "Please try asking again in a moment."
-            }), 200
-
-        # 3) Fetch the latest assistant message
-        messages = client.beta.threads.messages.list(
-            thread_id=thread.id,
-            limit=1
-        )
-
-        answer_text = ""
-
-        # messages.data is newest-first
-        for msg in messages.data:
-            for part in msg.content:
-                if part.type == "text":
-                    answer_text = part.text.value
-                    break
-            if answer_text:
-                break
-
-        if not answer_text:
-            answer_text = (
-                "I couldn’t find a clear answer for that. "
-                "You may want to contact support for more help."
+        # Poll until the run completes (or errors)
+        while run.status in ("queued", "in_progress"):
+            time.sleep(1.0)
+            run = client.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id,
             )
 
-        # 4) Return JSON that matches your SalesIQ mapping
-        return jsonify({"answer": answer_text}), 200
+        if run.status != "completed":
+            print(f"Run ended with status={run.status}, last_error={run.last_error}")
+            return jsonify(
+                {
+                    "answer": "I’m having trouble answering right now. "
+                              "Please try again or talk to a human.",
+                }
+            )
+
+        # Fetch the messages and find the latest assistant message
+        msgs = client.beta.threads.messages.list(thread_id=thread.id)
+        answer_text = "I’m not sure how to answer that."
+
+        for msg in msgs.data:
+            if msg.role == "assistant":
+                parts = []
+                for part in msg.content:
+                    if part.type == "text":
+                        parts.append(part.text.value)
+                if parts:
+                    answer_text = "\n\n".join(parts)
+                    break
+
+        print("Walter answer:", answer_text)
+        return jsonify({"answer": answer_text})
 
     except Exception as e:
-        # Log to stdout so Railway logs show the error
-        print("Error in /walter endpoint:", repr(e))
-
-        # Still return a safe JSON structure so SalesIQ doesn't explode
-        return jsonify({
-            "answer": "Something went wrong while I was trying to answer that. "
-                      "Please try again, or contact support directly."
-        }), 500
+        print("Error talking to OpenAI:", repr(e))
+        return jsonify(
+            {
+                "answer": "Something went wrong while talking to Walter’s brain. "
+                          "Please try again in a bit.",
+            }
+        )
 
 
 if __name__ == "__main__":
-    # For local testing; Railway will set PORT env var
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
