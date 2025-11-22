@@ -1,160 +1,167 @@
 import os
-import json
 import logging
-
-import requests
 from flask import Flask, request, jsonify
+from openai import OpenAI
+
+# --- Basic setup -------------------------------------------------------------
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Use the model that has been working for you
+MODEL = os.getenv("WALTER_MODEL", "gpt-4.1-mini")
+
+# --- Walter's system instructions -------------------------------------------
+
+SYSTEM_INSTRUCTIONS = """
+You are Walter, Intoxalock's friendly internal assistant for service centers.
+
+IDENTITY & TONE
+- You are speaking AS Intoxalock, not about Intoxalock in the third person.
+- Use “we” and “I” naturally, like an internal teammate.
+- Be clear, concise, and practical. Prefer short paragraphs and step-by-step lists.
+- You are here to help service centers with Intoxalock-related work only, not general automotive repair.
+
+GENERAL BEHAVIOR
+- You have access to multiple internal documents (manuals, FAQs, wiring diagram entries, onboarding guides, etc.).
+- For every question, first look for answers in these documents and use our language and processes whenever possible.
+- If a document includes a specific login page, portal, or resource with a URL, you MUST include that full URL directly in your answer so the user can click it.
+  - Example: “Go to https://servicecenter.intoxalock.com and sign in using your Intoxalock service center email.”
+- Prefer a short set of steps plus the relevant link instead of long, wordy explanations.
+
+WIRING DIAGRAMS – SPECIAL RULES
+- When someone asks for a wiring diagram, ALWAYS assume they are working on an Intoxalock ignition interlock installation or service.
+- Never tell them to check official OEM repair manuals, external repair databases, or “Audi/Honda/etc. service manuals.”
+- Instead, follow this process:
+
+  1) Clarify vehicle details if needed:
+     - If the user has NOT clearly given year, make, and model, ask a brief follow-up such as:
+       “Can you share the year, make, and model of the vehicle so I can check for the correct wiring diagram?”
+     - Once you have year, make, and model, treat the question as fully specified.
+
+  2) Search the attached “Wiring Diagram Entries” document and any other relevant resources:
+     - Look for an entry that best matches the given year, make, model (and any other details like engine or trim, if provided).
+     - If there are multiple plausible matches, choose the closest and, if needed, mention any important constraints (e.g., “This entry applies to 2019–2024 models.”).
+
+  3) If you find a wiring-diagram link:
+     - Do NOT print the long, raw URL in the sentence.
+     - Instead, phrase it exactly in this pattern (adjusting the vehicle description):
+       “You can view and download the wiring diagram for YEAR MAKE MODEL here.”
+     - The word “here” should be the hyperlink to the wiring-diagram URL you found in the document.
+     - If there are relevant usage notes in the entry (for example, ‘use ignition wire at fuse X’), summarize them briefly after the link.
+
+  4) If you CANNOT find a matching wiring diagram in the documents:
+     - Do NOT invent instructions or send them to OEM manuals.
+     - Instead, say something like:
+       “I’m not finding a wiring diagram for that specific vehicle in our resources.”
+     - Then follow the escalation guidance below.
+
+ESCALATION WHEN INFORMATION IS MISSING OR UNCERTAIN
+- If the documents do not give you enough information to confidently answer:
+  - Do NOT make anything up.
+  - Do NOT say “contact Intoxalock support.”
+  - Instead, use this style:
+    “I’m not completely sure from our documentation. You may want to chat with a live team member if one is available, or leave a message for follow-up if it’s outside our support hours.”
+- You may also add:
+  “If you’d like, you can tell me anything you’ve already tried, and I’ll see if there’s anything else we can troubleshoot together.”
+
+MICROSITE / PORTALS / LINKS
+- When a document specifies a login or portal URL (for example, service center microsites, internal portals, onboarding hubs, etc.), always:
+  - State the URL clearly in the answer.
+  - Provide simple steps: go to the URL, sign in with the correct type of credentials, and mention common next actions (e.g., “select the vehicle, open the wiring section,” etc.).
+- Example style:
+  “To log into the Intoxalock microsite, go to https://servicecenter.intoxalock.com and sign in with your Intoxalock service center email and password. If you don’t remember your login details, use the ‘Forgot password’ option on that page. If you still can’t get in, feel free to let me know and I’ll help you troubleshoot or connect with a team member.”
+
+CONVERSATION & CLARIFICATION
+- Always read the user’s latest question in context of what they said before.
+- If key details are missing (like vehicle year, make, model, state, or document name), ask one or two short, focused clarification questions before answering.
+- Keep follow-up questions light and helpful, not overwhelming.
+
+FAILSAFE RESPONSES
+- If the incoming payload from the webhook does NOT contain a usable question string, respond in this style:
+  “I didn’t receive a question to answer. Please type your Intoxalock service center question again.”
+- If there is an internal error or something goes wrong, apologize briefly and use the escalation phrasing:
+  “I’m having trouble fetching an answer right now. You may want to chat with a live team member if one is available, or leave a message for follow-up.”
+"""
+
+# --- Health check -----------------------------------------------------------
+
+@app.route("/", methods=["GET"])
+def health():
+    return "Walter webhook is running.", 200
 
 
-def extract_question(req) -> str | None:
-    """
-    Try several ways to pull `question` out of the incoming request.
-
-    Handles:
-    - Proper JSON: {"question": "..."}
-    - Normal form field: question=...
-    - Zoho/SalesIQ's odd form where the *key* is a JSON string:
-      {"{\"question\":\"...\"}": ""}
-    - Raw body like 'question=...' as a last resort.
-    """
-
-    # 1) Proper JSON body
-    try:
-        if req.is_json:
-            data = req.get_json(silent=True) or {}
-            q = data.get("question")
-            if q:
-                return q
-    except Exception as e:
-        logging.info(f"JSON parse failed: {e}")
-
-    # 2) Regular form field
-    if "question" in req.form:
-        q = req.form.get("question")
-        if q:
-            return q
-
-    # 3) Weird Zoho case: single form key that is itself JSON
-    if len(req.form) == 1:
-        only_key = next(iter(req.form.keys()))
-        try:
-            possible_json = json.loads(only_key)
-            q = possible_json.get("question")
-            if q:
-                return q
-        except Exception:
-            pass
-
-    # 4) Last resort: inspect raw body text
-    raw = req.get_data(as_text=True) or ""
-    if raw:
-        # e.g. "question=how do i log in"
-        if raw.startswith("question="):
-            return raw[len("question="):]
-
-        try:
-            data = json.loads(raw)
-            q = data.get("question")
-            if q:
-                return q
-        except Exception:
-            pass
-
-    return None
-
-
-def ask_openai(question: str) -> str:
-    """Call OpenAI and return Walter's answer."""
-    if not OPENAI_API_KEY:
-        return "Walter isn’t configured with an OpenAI API key yet."
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "model": "gpt-4.1-mini",
-        "input": [
-            {
-                "role": "system",
-                "content": (
-                        "You are Walter, Intoxalock's friendly internal assistant for service centers. "
-    "You are speaking *as* Intoxalock (use 'we' and 'I'), not about Intoxalock in the third person. "
-    "Always be clear, concise, and practical.\n\n"
-    "When the retrieved information includes a specific login page, portal, or resource with a URL, "
-    "you MUST include that full URL directly in your answer so the user can click it "
-    "(for example: 'Go to https://servicecenter.intoxalock.com and sign in...'). "
-    "Prefer to give a short set of steps plus the link instead of long paragraphs.\n\n"
-    "If you do NOT find enough information in the documents to confidently answer, "
-    "do NOT make anything up. Instead, say that you're not completely sure and recommend that "
-    "the user connect with a live team member in chat if available, "
-    "or leave a message for follow-up if it's outside support hours. "
-    "Do NOT tell them to 'contact Intoxalock support'; use this 'chat with a team member or leave a message' phrasing instead."
-                ),
-            },
-            {"role": "user", "content": question},
-        ],
-    }
-
-    resp = requests.post(
-        "https://api.openai.com/v1/responses",
-        headers=headers,
-        json=payload,
-        timeout=20,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    # responses API: output[0].content[0].text
-    try:
-        return data["output"][0]["content"][0]["text"].strip()
-    except Exception:
-        # If the shape changes, at least return something debuggable
-        return json.dumps(data)
-
+# --- Main webhook -----------------------------------------------------------
 
 @app.route("/walter", methods=["POST"])
 def walter():
-    # Log what we actually receive from Zoho
-    raw_body = request.get_data(as_text=True)
-    logging.info(f"Raw request body: {raw_body}")
-    logging.info(f"Headers: {dict(request.headers)}")
-    logging.info(f"Parsed form data: {request.form}")
-    logging.info(f"Parsed query args: {request.args}")
+    """
+    Expects JSON like: { "question": "how do I log into the microsite?" }
+    Returns: { "answer": "..." }
+    """
+    data = request.get_json(silent=True) or {}
+    logging.info("Incoming /walter payload: %s", data)
 
-    question = extract_question(request)
+    # Support both "question" and "visitor_question" just in case.
+    question = data.get("question") or data.get("visitor_question")
 
-    if not question:
-        logging.info("No question found in request; returning fallback answer.")
-        return jsonify({"answer": "I didn’t receive a question to answer."})
+    if not isinstance(question, str) or not question.strip():
+        logging.warning("No question found in payload.")
+        return jsonify({
+            "answer": "I didn’t receive a question to answer. Please type your Intoxalock service center question again."
+        })
 
-    logging.info(f"Question extracted: {question!r}")
+    question = question.strip()
+    logging.info("User question: %s", question)
+
+    # Build the input for the Responses API
+    prompt = [
+        {"role": "developer", "content": SYSTEM_INSTRUCTIONS},
+        {"role": "user", "content": question},
+    ]
 
     try:
-        answer = ask_openai(question)
-    except Exception as e:
-        logging.exception("Error calling OpenAI")
-        return (
-            jsonify(
-                {
-                    "answer": (
-                        "I ran into a problem looking that up. "
-                        "Please connect with a human so we can help you."
-                    )
-                }
-            ),
-            500,
+        resp = client.responses.create(
+            model=MODEL,
+            input=prompt,
+            max_output_tokens=600,
+            temperature=0.2,
         )
 
-    return jsonify({"answer": answer})
+        logging.info("OpenAI response id: %s", resp.id)
 
+        # Extract text safely from the Responses object
+        answer = None
+        try:
+            answer = resp.output[0].content[0].text.value.strip()
+        except Exception as e:
+            logging.warning("Could not parse response output cleanly: %s", e)
+
+        if not answer:
+            logging.warning("Empty answer from model; using fallback.")
+            answer = (
+                "I’m not completely sure from our documentation. "
+                "You may want to chat with a live team member if one is available, "
+                "or leave a message for follow-up if it’s outside our support hours."
+            )
+
+        return jsonify({"answer": answer})
+
+    except Exception as e:
+        logging.exception("Error when talking to OpenAI: %s", e)
+        return jsonify({
+            "answer": (
+                "I’m having trouble fetching an answer right now. "
+                "You may want to chat with a live team member if one is available, "
+                "or leave a message for follow-up."
+            )
+        }), 500
+
+
+# --- Local dev entrypoint ---------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
