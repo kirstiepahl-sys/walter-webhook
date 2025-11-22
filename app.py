@@ -104,32 +104,17 @@ def walter():
     data = request.get_json(silent=True) or {}
     logging.info("Incoming /walter payload: %s", data)
 
-    # --- MINIMAL CHANGE: make question extraction tolerant, never early-return ---
-    raw_question = (
-        data.get("question")
-        or data.get("visitor_question")
-        or data.get("input")
-        or data.get("input_text")
-        or data.get("message")
-        or data.get("text")
-        or ""
-    )
+    # Support both "question" and "visitor_question" just in case.
+    question = data.get("question") or data.get("visitor_question")
 
-    # If some integrations nest the text inside an object, try to pull it out.
-    if isinstance(raw_question, dict):
-        raw_question = raw_question.get("text") or ""
+    if not isinstance(question, str) or not question.strip():
+        logging.warning("No question found in payload.")
+        return jsonify({
+            "answer": "I didn’t receive a question to answer. Please type your Intoxalock service center question again."
+        })
 
-    question = str(raw_question).strip()
-    logging.info("Resolved question string: %r", question)
-
-    # If we still don't have anything, let the *model* handle the failsafe message.
-    if not question:
-        logging.warning("No usable question found in payload; delegating to model.")
-        question = (
-            "The system did not capture any visible text from the user's last "
-            "message. Please politely ask them to type their Intoxalock service "
-            "center question again so you can help."
-        )
+    question = question.strip()
+    logging.info("User question: %s", question)
 
     # Build the input for the Responses API
     prompt = [
@@ -146,13 +131,32 @@ def walter():
         )
 
         logging.info("OpenAI response id: %s", resp.id)
+        logging.info("Raw OpenAI response object: %s", resp)
 
-        # Extract text safely from the Responses object
+        # ------------------------------------------------------------------
+        # SINGLE TWEAK: make answer extraction more robust so we don't fall
+        # into the "not completely sure" fallback when the model actually
+        # returned text.
+        # ------------------------------------------------------------------
         answer = None
         try:
-            answer = resp.output[0].content[0].text.value.strip()
-        except Exception as e:
-            logging.warning("Could not parse response output cleanly: %s", e)
+            # Primary: attribute-style (recommended for new SDK)
+            answer = resp.output[0].content[0].text.value
+        except Exception as e1:
+            logging.warning("Primary parse (attr) failed: %s", e1)
+            try:
+                # Fallback: dict-style access
+                answer = resp.output[0]["content"][0]["text"]["value"]
+            except Exception as e2:
+                logging.warning("Secondary parse (dict) failed: %s", e2)
+                try:
+                    # Last resort: coerce whatever is there to string
+                    answer = str(resp.output[0].content[0].text).strip()
+                except Exception as e3:
+                    logging.warning("Tertiary parse (string) failed: %s", e3)
+
+        if answer:
+            answer = answer.strip()
 
         if not answer:
             logging.warning("Empty answer from model; using fallback.")
@@ -180,4 +184,3 @@ def walter():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))
     app.run(host="0.0.0.0", port=port)
-
