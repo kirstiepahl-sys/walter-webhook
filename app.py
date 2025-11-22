@@ -1,187 +1,201 @@
 import os
+import json
 import logging
 
 from flask import Flask, request, jsonify
 import requests
 
 app = Flask(__name__)
+
+# --- logging -----------------------------------------------------------
+
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# -------------------------------------------------------------------
-# Config
-# -------------------------------------------------------------------
+# --- config ------------------------------------------------------------
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+ASSISTANT_ID = os.environ.get("ASSISTANT_ID")  # set this in Railway variables
 
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is not set.")
-
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
-OPENAI_MODEL = "gpt-4.1-mini"  # adjust if you want a different model
-
-# -------------------------------------------------------------------
-# System prompt for Walter
-# -------------------------------------------------------------------
-SYSTEM_PROMPT = """
-You are Walter, the Intoxalock Service Center virtual assistant.
-
-You speak **as Intoxalock**, not about Intoxalock in the third person.
-- Use “we”, “our team”, “our microsite”, etc.
-- Avoid phrases like “Intoxalock provides…” or “Intoxalock gives you…”.
-  Instead say “We provide…”, “We give you…”, “Our team…”.
-
-Audience:
-- Intoxalock service center partners and staff.
-- They are usually asking about processes, policies, portals, paperwork,
-  installations, pricing rules, or support workflows.
-
-Tone:
-- Friendly, concise, professional, and confident.
-- Get to the point quickly, then offer a short follow-up like
-  “If anything doesn’t match what you’re seeing, let us know.”
-
-Truthfulness and use of documentation:
-- Prefer the exact wording and details from the internal documentation
-  and Q&A you’ve been trained on.
-- DO NOT invent URLs, phone numbers, email addresses, prices, or policies.
-- If the documentation doesn’t clearly answer the question, say that you’re
-  not completely sure and recommend contacting Service Center Support or a
-  human teammate instead of guessing.
-
-Microsite login rules (very important):
-- When someone asks where or how to log in to “the microsite”,
-  “service center portal”, “Intoxalock portal for shops”, or anything
-  clearly referring to the Intoxalock service center microsite, you MUST:
-  1) Give this exact URL: https://servicecenter.intoxalock.com
-  2) Say that they should sign in using their Service Center email and password.
-- Keep this answer short and direct unless they ask for more detail.
-
-Out-of-scope:
-- If a question is not about Intoxalock, our service centers, our customers,
-  or our tools, say that Walter is focused on Intoxalock service center
-  support and suggest they contact the appropriate resource instead.
-
-Formatting:
-- Answer in plain text (no markdown lists unless the question clearly
-  benefits from step-by-step bullets).
-- Be specific, but avoid long, rambling paragraphs.
-"""
+OPENAI_API_BASE = "https://api.openai.com/v1"
 
 
-# -------------------------------------------------------------------
-# Helpers
-# -------------------------------------------------------------------
-def extract_question(payload: dict) -> str:
+# --- helpers -----------------------------------------------------------
+
+def extract_question(req) -> str:
     """
-    Try a few common keys to get the user's question.
-    Main path is 'question', but we keep fallbacks in case SalesIQ
-    changes formatting later.
+    Try very hard to extract the user's question from the incoming request.
+
+    We support:
+    - JSON body
+    - form-encoded body
+    - raw body containing JSON
+    - query parameter ?question=
+    And multiple field names: question / visitor.question / visitor_question.
     """
-    if not isinstance(payload, dict):
-        return ""
 
-    # Primary key – what we configured in SalesIQ
-    question = payload.get("question")
+    payload = {}
 
-    # Fallbacks (older experiments)
-    if not question:
-        question = payload.get("visitor.question")
-    if not question:
-        question = payload.get("visitor_question")
+    # 1) JSON body
+    try:
+        if req.is_json:
+            payload = req.get_json(silent=True) or {}
+    except Exception as e:
+        logger.exception("Error parsing JSON body: %s", e)
 
-    if isinstance(question, str):
-        return question.strip()
+    # 2) form-encoded body
+    if not payload:
+        try:
+            form_data = req.form.to_dict()
+            if form_data:
+                payload = form_data
+        except Exception as e:
+            logger.exception("Error reading form body: %s", e)
 
-    return ""
+    # 3) raw body (might be JSON string)
+    if not payload:
+        raw = req.get_data(cache=False, as_text=True) or ""
+        if raw.strip():
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                # not JSON; just log for debugging
+                logger.info("Raw body (non-JSON): %r", raw)
+
+    logger.info("Incoming payload after parsing: %s", payload)
+
+    # 4) finally, querystring
+    question = (
+        payload.get("question")
+        or payload.get("visitor.question")
+        or payload.get("visitor_question")
+        or payload.get("text")
+        or req.args.get("question")
+        or ""
+    )
+
+    if question is None:
+        question = ""
+
+    question = str(question).strip()
+    logger.info("Extracted question: %r", question)
+    return question
 
 
-def call_openai_chat(question: str) -> str:
+def call_openai_assistant(question: str) -> str:
     """
-    Call OpenAI Chat Completions to get Walter's answer.
+    Call your OpenAI Assistant (with vector store attached) via the Responses API.
     """
+
+    if not OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY is not set")
+        return (
+            "I’m having trouble accessing my knowledge right now because my API key "
+            "is missing. Please contact Intoxalock support for help."
+        )
+
+    if not ASSISTANT_ID:
+        logger.error("ASSISTANT_ID is not set")
+        return (
+            "I’m not fully configured yet (missing assistant ID). "
+            "Please contact Intoxalock support so we can fix this."
+        )
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
+        "OpenAI-Beta": "assistants=v2",
     }
 
     body = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": question},
+        "model": "gpt-4.1-mini",
+        "assistant_id": ASSISTANT_ID,
+        "input": [
+            {
+                "role": "user",
+                "content": question,
+            }
         ],
-        "temperature": 0.3,
+        # System / style instructions live on the Assistant itself in the UI.
+        # If you ever want to add *extra* one-off instructions, you can use:
+        # "metadata" or an additional "input" message with role "assistant".
     }
 
     try:
         resp = requests.post(
-            OPENAI_API_URL, headers=headers, json=body, timeout=30
+            f"{OPENAI_API_BASE}/responses",
+            headers=headers,
+            json=body,
+            timeout=30,
         )
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info("OpenAI response JSON: %s", json.dumps(data, indent=2))
+
+        # Prefer the convenience field if present
+        answer_text = None
+
+        # Newer Responses API sometimes includes `output_text`
+        if isinstance(data, dict) and "output_text" in data:
+            ot = data["output_text"]
+            if isinstance(ot, dict):
+                choices = ot.get("choices") or []
+                if choices:
+                    answer_text = choices[0].get("text")
+
+        # Fallback: walk the `output` list
+        if not answer_text:
+            output = data.get("output") or []
+            texts = []
+            for item in output:
+                # each item has "content": [{"type": "output_text", "text": {...}}]
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text":
+                        text_obj = c.get("text") or {}
+                        parts = text_obj.get("value") or ""
+                        texts.append(parts)
+            if texts:
+                answer_text = "\n".join(texts)
+
+        if not answer_text:
+            logger.error("Could not extract answer text from OpenAI response")
+            return (
+                "I wasn’t able to read the answer from my knowledge base. "
+                "Please reach out to Intoxalock support for assistance."
+            )
+
+        return answer_text.strip()
+
     except Exception as e:
-        app.logger.error("Error talking to OpenAI: %s", e)
+        logger.exception("Error talking to OpenAI: %s", e)
         return (
-            "I’m having trouble pulling that information right now. "
-            "Please try again in a moment or connect with a human teammate."
+            "I’m having trouble reaching my knowledge base right now. "
+            "Please contact Intoxalock support or try again in a few minutes."
         )
 
-    if resp.status_code != 200:
-        app.logger.error(
-            "OpenAI error %s: %s", resp.status_code, resp.text[:1000]
-        )
-        return (
-            "I’m having trouble pulling that information right now. "
-            "Please try again in a moment or connect with a human teammate."
-        )
 
-    data = resp.json()
-    try:
-        answer = data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        app.logger.error("Error parsing OpenAI response: %s", e)
-        return (
-            "I’m having trouble pulling that information right now. "
-            "Please try again in a moment or connect with a human teammate."
-        )
-
-    return answer
-
-
-# -------------------------------------------------------------------
-# Routes
-# -------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def health():
-    return "Walter is alive ✅", 200
-
+# --- routes ------------------------------------------------------------
 
 @app.route("/walter", methods=["POST"])
 def walter():
-    """
-    Main webhook endpoint for Zoho SalesIQ.
-
-    Expected body (JSON):
-      { "question": "How do I log into the microsite?" }
-
-    Response:
-      { "answer": "..." }
-
-    SalesIQ maps this 'answer' field to the walter_answer variable.
-    """
-    payload = request.get_json(silent=True) or {}
-    app.logger.info("Incoming payload: %s", payload)
-
-    question = extract_question(payload)
+    question = extract_question(request)
 
     if not question:
-        # This is what you saw earlier when the question wasn't wired through.
-        return jsonify({"answer": "I didn’t receive a question to answer."}), 200
+        logger.info("No question found in request; sending default message.")
+        return jsonify(
+            {
+                "answer": "I didn’t receive a question to answer. "
+                          "Please type your question and send it again."
+            }
+        )
 
-    answer = call_openai_chat(question)
-    return jsonify({"answer": answer}), 200
+    answer = call_openai_assistant(question)
+    return jsonify({"answer": answer})
 
 
-# -------------------------------------------------------------------
-# Entry point
-# -------------------------------------------------------------------
+# --- main --------------------------------------------------------------
+
 if __name__ == "__main__":
-    # For local testing. Railway overrides host/port.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    # Railway sets PORT; default to 8080 for local tests
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)
