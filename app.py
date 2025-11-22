@@ -1,81 +1,119 @@
 import os
+import time
 from flask import Flask, request, jsonify
 from openai import OpenAI
 
 app = Flask(__name__)
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# Hard-coded Assistant ID (your real one)
+# ---------------------------
+#  CONFIG: your Assistant ID
+# ---------------------------
 ASSISTANT_ID = "asst_Q0N8ruhG6yWNJUVPtk1HZca7"
+
+# OpenAI client (uses OPENAI_API_KEY env var)
+client = OpenAI()
+
 
 @app.route("/walter", methods=["POST"])
 def walter():
+    """
+    Webhook endpoint for Zoho SalesIQ.
+    Expects JSON like: { "question": "user text here" }
+    Returns JSON like: { "answer": "Walter's reply" }
+    """
+    # Safely parse body
+    data = request.get_json(force=True, silent=True) or {}
+    print("RAW REQUEST:", data)
+
+    # Pick up the question (we support both keys just in case)
+    question = (
+        data.get("question")
+        or data.get("visitor_question")
+        or ""
+    )
+
+    if not question.strip():
+        # SalesIQ will still get a valid JSON answer
+        return jsonify({
+            "answer": (
+                "I didn’t receive a question to answer. "
+                "Please type your Intoxalock service center question again."
+            )
+        })
+
     try:
-        data = request.get_json(silent=True) or {}
-        print("RAW REQUEST:", data)
+        # Create a new thread for this question
+        thread = client.beta.threads.create()
 
-        question = data.get("question", "").strip()
-        print("Extracted question:", question)
-
-        if not question:
-            print("ERROR: No question received.")
-            return jsonify({"answer": "I didn’t receive a question to answer."})
-
-        # Create a thread
-        thread = client.threads.create()
-        thread_id = thread.id
-        print("Created thread:", thread_id)
-
-        # Add the user question
-        client.threads.messages.create(
-            thread_id=thread_id,
+        # Add the user message
+        client.beta.threads.messages.create(
+            thread_id=thread.id,
             role="user",
             content=question
         )
-        print("Posted question to thread.")
 
-        # Run the assistant
-        run = client.threads.runs.create_and_poll(
-            thread_id=thread_id,
+        # Start a run with your Assistant
+        run = client.beta.threads.runs.create(
+            thread_id=thread.id,
             assistant_id=ASSISTANT_ID
         )
-        print("Assistant run status:", run.status)
+
+        # Poll until the run finishes
+        while True:
+            run = client.beta.threads.runs.retrieve(
+                thread_id=thread.id,
+                run_id=run.id,
+            )
+            if run.status in ("completed", "failed", "cancelled", "expired"):
+                break
+            time.sleep(0.5)
 
         if run.status != "completed":
-            print("ERROR: Run did not complete:", run.status)
-            return jsonify({"answer": "Walter could not complete the request."})
+            # Graceful failure message
+            return jsonify({
+                "answer": (
+                    "I’m having trouble answering right now. "
+                    "Please try again or connect with a member of the "
+                    "Intoxalock Service Center team."
+                )
+            })
 
-        # Get messages
-        messages = client.threads.messages.list(thread_id=thread_id)
-        print("Messages returned:", messages)
+        # Fetch messages and pull the assistant's text
+        messages = client.beta.threads.messages.list(thread_id=thread.id)
 
-        final_answer = ""
+        assistant_text_chunks = []
+        for msg in messages.data:
+            if msg.role == "assistant":
+                for part in msg.content:
+                    if getattr(part, "type", None) == "text":
+                        assistant_text_chunks.append(part.text.value)
 
-        if messages.data:
-            # Get the most recent assistant message
-            for msg in messages.data:
-                if msg.role == "assistant":
-                    final_answer = msg.content[0].text.value
-                    break
+        # Most recent assistant message last → reverse to read newest first
+        answer = "\n\n".join(reversed(assistant_text_chunks)).strip()
 
-        if not final_answer:
-            final_answer = "I'm sorry — I couldn't find an answer for that."
+        if not answer:
+            answer = (
+                "I’m not sure how to answer that. "
+                "Please try rephrasing your question or reach out to the "
+                "Intoxalock Service Center team."
+            )
 
-        print("FINAL ANSWER:", final_answer)
-
-        return jsonify({"answer": final_answer})
+        print("WALTER ANSWER:", answer)
+        return jsonify({"answer": answer})
 
     except Exception as e:
-        print("ERROR:", str(e))
-        return jsonify({"answer": f"Server error: {str(e)}"})
-
-
-@app.route("/")
-def home():
-    return "Walter API is running."
+        # Never crash the webhook – always return a JSON answer
+        print("ERROR IN /walter:", repr(e))
+        return jsonify({
+            "answer": (
+                "I’m having trouble answering right now. "
+                "Please try again or connect with a member of the "
+                "Intoxalock Service Center team."
+            )
+        })
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    # Railway sets PORT env var; default 8080 for local runs
+    port = int(os.getenv("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
