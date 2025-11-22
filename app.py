@@ -191,30 +191,36 @@ def walter():
 
     if not question:
         logging.info("No question found in request; returning fallback answer.")
+        # Make sure there's always *some* text in all the common keys
+        msg = (
+            "I didn't receive a question to answer. "
+            "Please type your question in and try again."
+        )
         return jsonify({
-            "answer": "I didn't receive a question to answer. Please type your question in and try again."
+            "answer": msg,
+            "message": msg,
+            "text": msg,
         })
 
     logging.info("Question extracted: %s", question)
 
     try:
-        # 🔧 TEMP: BYPASS OPENAI so we can confirm end-to-end wiring
-        answer = f'DEBUG: Walter webhook is working. I received: "{question}".'
-
-        # Once we confirm this shows up in SalesIQ, we will switch back to:
-        # answer = call_openai_walter(question)
-
+        answer = call_openai_walter(question)
     except Exception as e:
-        logging.exception("Error (even in debug mode): %s", e)
+        logging.exception("Unexpected error getting Walter answer: %s", e)
         answer = (
-            "I ran into a problem in the Walter webhook. "
+            "I’m sorry, I ran into a problem talking to Walter. "
             "Please connect with a human so we can help you."
         )
 
-    return jsonify({"answer": answer})
+    # 🔑 Return the same content under several keys so any mapping still works
+    return jsonify({
+        "answer": answer,
+        "message": answer,
+        "text": answer,
+    })
 
 
 if __name__ == "__main__":
     # For local testing, run the app
     app.run(host="0.0.0.0", port=8081)
-
