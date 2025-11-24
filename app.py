@@ -179,7 +179,7 @@ def walter():
     Shape: { "answer": "..." } to match your old mapping.
     """
 
-    # 🔧 CHANGE: use silent=True so bad/empty JSON never throws
+    # Use silent=True so bad/empty JSON never throws
     payload = request.get_json(silent=True) or {}
     logging.info("Incoming payload: %s", payload)
 
@@ -208,4 +208,6 @@ def walter():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8081)
+    # 🔑 IMPORTANT: listen on the port Railway provides
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
