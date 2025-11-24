@@ -8,15 +8,14 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# IMPORTANT: set this in Railway
-# e.g. INTX_OPENAI_API_KEY = sk-xxxx
+# IMPORTANT: set this in Railway, e.g. INTX_OPENAI_API_KEY = sk-xxxx
 OPENAI_API_KEY = os.getenv("INTX_OPENAI_API_KEY")
 
 
 def extract_question(payload) -> str:
     """
-    Same style as your last working code:
-    pull the visitor's question from a few possible places.
+    Pull the visitor's question from a few possible places.
+    Mirrors your last working logic.
     """
 
     # 1) Direct: {"question": "..."}
@@ -57,8 +56,8 @@ def extract_question(payload) -> str:
 def call_openai_walter(user_question: str) -> str:
     """
     Call OpenAI's /v1/responses endpoint using requests,
-    exactly like your earlier working version, with only
-    the system prompt updated.
+    same pattern as your previous working version, with
+    only the system prompt updated.
     """
 
     if not OPENAI_API_KEY:
@@ -179,7 +178,9 @@ def walter():
     and return Walter's answer as JSON.
     Shape: { "answer": "..." } to match your old mapping.
     """
-    payload = request.get_json(force=True) or {}
+
+    # 🔧 CHANGE: use silent=True so bad/empty JSON never throws
+    payload = request.get_json(silent=True) or {}
     logging.info("Incoming payload: %s", payload)
 
     question = extract_question(payload)
