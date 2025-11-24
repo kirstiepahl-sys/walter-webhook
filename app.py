@@ -11,8 +11,8 @@ logging.basicConfig(level=logging.INFO)
 
 client = OpenAI()  # Uses OPENAI_API_KEY from env
 
-# IMPORTANT: set this in your environment
-VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID")
+# Your vector store ID (from OpenAI)
+VECTOR_STORE_ID = "vs_6920cf818eb8819187f1fcf4c64aba92"
 
 SYSTEM_INSTRUCTIONS = """
 You are “Walter”, Intoxalock’s AI support assistant.
@@ -45,17 +45,15 @@ def ask_walter(user_message: str, previous_response_id: str | None = None) -> st
     Returns plain answer text.
     """
     if not VECTOR_STORE_ID:
-        logging.error("OPENAI_VECTOR_STORE_ID is not set")
+        logging.error("VECTOR_STORE_ID is not set")
         return (
             "I’m currently not able to access my knowledge base. "
             "Please contact Intoxalock support for help."
         )
 
     try:
-        # Build the input with system + user
-        # Using Responses API (stateful, supports file_search)
         response = client.responses.create(
-            model="gpt-4o-mini",  # or gpt-4o if you prefer
+            model="gpt-4o-mini",  # or "gpt-4o" if you want the bigger model
             instructions=SYSTEM_INSTRUCTIONS,
             input=[
                 {
@@ -73,19 +71,17 @@ def ask_walter(user_message: str, previous_response_id: str | None = None) -> st
             max_output_tokens=800,
         )
 
-        # Simplest way to get the final text
-        # Most guides: response.output[0].content[0].text or response.output_text
+        # Try to grab the answer text
         answer_text = getattr(response, "output_text", None)
         if not answer_text:
-            # Fallback: dig into output list
             try:
+                # Fallback path if output_text isn't set
                 answer_text = response.output[0].content[0].text
             except Exception:
                 logging.warning("Could not parse output_text from response")
                 answer_text = ""
 
         if not answer_text:
-            # Very defensive fallback
             return (
                 "I’m not seeing enough information in my documents to answer that. "
                 "Please try rephrasing your question or ask to be connected to a representative."
@@ -137,7 +133,7 @@ def walter_endpoint():
         {
             "success": True,
             "answer": answer,
-            # you can also send back previous_response_id=response.id later
+            # You can add "response_id": response.id later if you want threading
         }
     )
 
