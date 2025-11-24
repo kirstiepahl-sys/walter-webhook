@@ -8,55 +8,57 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# OpenAI key from env
+# IMPORTANT: set this in Railway
+# e.g. INTX_OPENAI_API_KEY = sk-xxxx
 OPENAI_API_KEY = os.getenv("INTX_OPENAI_API_KEY")
 
 
 def extract_question(payload) -> str:
     """
-    Try several ways to pull a 'question' out of the incoming request.
-    This matches the style of your last working version.
+    Same style as your last working code:
+    pull the visitor's question from a few possible places.
     """
 
     # 1) Direct: {"question": "..."}
     if "question" in payload:
         q = payload["question"]
-        if isinstance(q, str) and q.strip() != "":
+        if isinstance(q, str) and q.strip():
             return q.strip()
 
-    # 2) From 'data' list
+    # 2) From 'data' list (SalesIQ style)
     try:
         data_list = payload.get("data") or payload.get("chat") or []
-        if isinstance(data_list, list) and len(data_list) > 0:
+        if isinstance(data_list, list) and data_list:
             msg = data_list[0].get("question") or ""
-            if isinstance(msg, str) and msg.strip() != "":
+            if isinstance(msg, str) and msg.strip():
                 return msg.strip()
     except Exception as e:
         logging.info(f"Data parse failed: {e}")
 
     # 3) From 'input'
-    if "input" in payload:
-        maybe = payload["input"]
-        if isinstance(maybe, str) and maybe.strip() != "":
-            return maybe.strip()
+    maybe = payload.get("input")
+    if isinstance(maybe, str) and maybe.strip():
+        return maybe.strip()
 
     # 4) From 'visitor'
     try:
         visitor = payload.get("visitor") or {}
         if isinstance(visitor, dict):
             msg = visitor.get("question") or visitor.get("input") or ""
-            if isinstance(msg, str) and msg.strip() != "":
+            if isinstance(msg, str) and msg.strip():
                 return msg.strip()
     except Exception as e:
-        logging.info(f"Visitor parse failed: {e}")
+        logging.info(f"Visitor parse (visitor) failed: {e}")
 
-    # If we can't parse, return empty
+    # If nothing found, return empty
     return ""
 
 
 def call_openai_walter(user_question: str) -> str:
     """
-    Send the user's question into Walter via OpenAI.
+    Call OpenAI's /v1/responses endpoint using requests,
+    exactly like your earlier working version, with only
+    the system prompt updated.
     """
 
     if not OPENAI_API_KEY:
@@ -71,7 +73,6 @@ def call_openai_walter(user_question: str) -> str:
         "Content-Type": "application/json",
     }
 
-    # System prompt with microsite + wiring rules
     system_prompt = """
 You are Walter, Intoxalock's friendly internal assistant for service centers.
 
@@ -158,19 +159,9 @@ CONVERSATION & CLARIFICATION
         response_json = resp.json()
         logging.info("Raw OpenAI response: %s", response_json)
 
-        answer = None
-
-        # Try convenience field first if present
-        if isinstance(response_json.get("output_text"), dict):
-            answer = response_json["output_text"].get("content")
-
-        # Fallback to nested structure
-        if not answer:
-            answer = response_json["output"][0]["content"][0]["text"]["value"]
-
-        if answer:
-            answer = answer.strip()
-
+        # ORIGINAL-style parse: output[0].content[0].text.value
+        answer = response_json["output"][0]["content"][0]["text"]["value"]
+        answer = (answer or "").strip()
         if not answer:
             raise ValueError("Empty answer from Walter")
 
@@ -186,6 +177,7 @@ def walter():
     """
     Main endpoint: accept a JSON payload from Zoho
     and return Walter's answer as JSON.
+    Shape: { "answer": "..." } to match your old mapping.
     """
     payload = request.get_json(force=True) or {}
     logging.info("Incoming payload: %s", payload)
@@ -198,16 +190,7 @@ def walter():
             "I didn't receive a question to answer. "
             "Please type your question in and try again."
         )
-        return jsonify({
-            "answer": msg,
-            "message": msg,
-            "text": msg,
-            "data": {
-                "answer": msg,
-                "message": msg,
-                "text": msg,
-            },
-        })
+        return jsonify({"answer": msg})
 
     logging.info("Question extracted: %s", question)
 
@@ -220,19 +203,8 @@ def walter():
             "Please connect with a human so we can help you."
         )
 
-    # Return answer in several common fields so SalesIQ can map any of them
-    return jsonify({
-        "answer": answer,
-        "message": answer,
-        "text": answer,
-        "data": {
-            "answer": answer,
-            "message": answer,
-            "text": answer,
-        },
-    })
+    return jsonify({"answer": answer})
 
 
 if __name__ == "__main__":
-    # For local testing
     app.run(host="0.0.0.0", port=8081)
