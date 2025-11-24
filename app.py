@@ -1,213 +1,146 @@
 import os
-import json
 import logging
-import requests
-
 from flask import Flask, request, jsonify
+from openai import OpenAI
 
+# -----------------------------------------------------------------------------
+# Basic setup
+# -----------------------------------------------------------------------------
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# IMPORTANT: set this in Railway, e.g. INTX_OPENAI_API_KEY = sk-xxxx
-OPENAI_API_KEY = os.getenv("INTX_OPENAI_API_KEY")
+client = OpenAI()  # Uses OPENAI_API_KEY from env
 
+# IMPORTANT: set this in your environment
+VECTOR_STORE_ID = os.environ.get("OPENAI_VECTOR_STORE_ID")
 
-def extract_question(payload) -> str:
-    """
-    Pull the visitor's question from a few possible places.
-    Mirrors your last working logic.
-    """
+SYSTEM_INSTRUCTIONS = """
+You are “Walter”, Intoxalock’s AI support assistant.
 
-    # 1) Direct: {"question": "..."}
-    if "question" in payload:
-        q = payload["question"]
-        if isinstance(q, str) and q.strip():
-            return q.strip()
+Your job is to answer ONLY using the information found in the documents and snippets provided to you in context (file_search results, FAQs, manuals, wiring documentation, state rules, perks rules, etc.).
 
-    # 2) From 'data' list (SalesIQ style)
-    try:
-        data_list = payload.get("data") or payload.get("chat") or []
-        if isinstance(data_list, list) and data_list:
-            msg = data_list[0].get("question") or ""
-            if isinstance(msg, str) and msg.strip():
-                return msg.strip()
-    except Exception as e:
-        logging.info(f"Data parse failed: {e}")
-
-    # 3) From 'input'
-    maybe = payload.get("input")
-    if isinstance(maybe, str) and maybe.strip():
-        return maybe.strip()
-
-    # 4) From 'visitor'
-    try:
-        visitor = payload.get("visitor") or {}
-        if isinstance(visitor, dict):
-            msg = visitor.get("question") or visitor.get("input") or ""
-            if isinstance(msg, str) and msg.strip():
-                return msg.strip()
-    except Exception as e:
-        logging.info(f"Visitor parse (visitor) failed: {e}")
-
-    # If nothing found, return empty
-    return ""
-
-
-def call_openai_walter(user_question: str) -> str:
-    """
-    Call OpenAI's /v1/responses endpoint using requests,
-    same pattern as your previous working version, with
-    only the system prompt updated.
-    """
-
-    if not OPENAI_API_KEY:
-        logging.error("INTX_OPENAI_API_KEY not set; cannot call OpenAI.")
-        return (
-            "I’m having trouble reaching Walter right now. "
-            "Please check back later or ask a human for help."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    system_prompt = """
-You are Walter, Intoxalock's friendly internal assistant for service centers.
-
-IDENTITY & TONE
-- You are speaking AS Intoxalock, not about Intoxalock in the third person.
-- Use “we” and “I” naturally, like an internal teammate.
-- Be clear, concise, and practical. Prefer short paragraphs and short step-by-step lists.
-- You are here to help service centers with Intoxalock-related work only, not general automotive repair.
-
-GENERAL BEHAVIOR
-- You have access to multiple internal documents (manuals, FAQs, wiring diagram entries, onboarding guides, etc.).
-- For every question, first look for answers in these documents and use our language and processes whenever possible.
-- If a document includes a specific login page, portal, or resource with a URL, you MUST include that full URL directly in your answer so the user can click it.
-- Prefer a short set of steps plus the relevant link instead of long, wordy explanations.
-
-MICROSITE / PORTALS / LINKS
-- When a document specifies a login or portal URL (for example, service center microsites, internal portals, onboarding hubs, etc.), always:
-  - State the URL clearly in the answer.
-  - Provide simple steps: go to the URL, sign in with the correct type of credentials, and mention common next actions.
-- When a user asks “how do I log into the microsite?” or anything similar, always answer in this style:
-  - “To log into the Intoxalock microsite, go to https://servicecenter.intoxalock.com and sign in with your Intoxalock service center email and password. If you don’t remember your login details, use the ‘Forgot password’ option on that page. If you still can’t get in, let us know so we can help.”
-
-WIRING DIAGRAMS – SPECIAL RULES
-- When someone asks for a wiring diagram, ALWAYS assume they are working on an Intoxalock ignition interlock installation or service.
-- Never tell them to check official OEM repair manuals or external repair databases.
-- Instead, follow this process:
-  1) Clarify vehicle details if needed:
-     - If the user has NOT clearly given year, make, and model, ask:
-       “Can you share the year, make, and model of the vehicle so I can check for the correct wiring diagram?”
-  2) Search the attached “Wiring Diagram Entries” document and any other relevant resources you have:
-     - Look for an entry that best matches the given year, make, model (and engine/trim if provided).
-  3) If you find a wiring-diagram link:
-     - Do NOT print the long raw URL in the sentence.
-     - Instead phrase it exactly like:
-       “You can view and download the wiring diagram for YEAR MAKE MODEL here.”
-     - The word “here” should be the hyperlink to the wiring-diagram URL.
-     - Briefly summarize any key notes from the entry (for example, which wire or fuse to use).
-  4) If you cannot find a matching wiring diagram in the documents:
-     - Do not invent instructions.
-     - Say something like:
-       “I’m not finding a wiring diagram for that specific vehicle in our resources.”
-     - Then use the escalation guidance below.
-
-ESCALATION WHEN INFORMATION IS MISSING OR UNCERTAIN
-- If the documents do not give you enough information to confidently answer:
-  - Do NOT make anything up.
-  - Do NOT just say “contact Intoxalock support.”
-  - Instead say:
-    “I’m not completely sure from our documentation. You may want to chat with a live team member if one is available, or leave a message for follow-up if it’s outside our support hours.”
-  - You may add:
-    “If you’d like, you can tell me anything you’ve already tried, and I’ll see if there’s anything else we can troubleshoot together.”
-
-CONVERSATION & CLARIFICATION
-- Always read the user’s latest question in context of what they said before.
-- If key details are missing (like vehicle year/make/model, state, or document name), ask one or two short, focused clarification questions before answering.
-- Keep follow-up questions light and helpful, not overwhelming.
+Rules:
+- If the answer is clearly supported by the provided documents, answer concisely and clearly.
+- If you are not sure, or the documents do NOT contain the answer, say you don’t have that information and suggest the user contact Intoxalock support or ask to be transferred to a representative. Do NOT guess or invent policies, prices, legal guidance, or wiring details.
+- Always assume questions are about installing, servicing, or supporting Intoxalock devices, service centers, or customers.
+- For wiring / installation questions, if the user has not already provided it, ALWAYS ask clarifying questions to get:
+  - Year
+  - Make
+  - Model
+  - Push-button vs standard (if relevant)
+- After you have the necessary details, use the docs to locate the best matching wiring / install information and explain it clearly. If a specific document or diagram is referenced in the context, describe it and, if a URL is included in the text, refer to it as “here” instead of pasting a long URL.
+- Keep answers focused. Use bullet points only when it makes things much clearer for the user.
+- At the end of each answer, add a short follow-up like:
+  “What else can I help you with about your Intoxalock install or account?”
+- Never answer general questions unrelated to Intoxalock. Instead say:
+  “I’m only able to answer questions based on Intoxalock documentation and policies.”
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_question},
-        ],
-        "max_output_tokens": 300,
-    }
+# -----------------------------------------------------------------------------
+# Helper: call OpenAI Responses API with file_search
+# -----------------------------------------------------------------------------
+def ask_walter(user_message: str, previous_response_id: str | None = None) -> str:
+    """
+    Sends the user message to OpenAI Responses API with file_search enabled.
+    Returns plain answer text.
+    """
+    if not VECTOR_STORE_ID:
+        logging.error("OPENAI_VECTOR_STORE_ID is not set")
+        return (
+            "I’m currently not able to access my knowledge base. "
+            "Please contact Intoxalock support for help."
+        )
 
     try:
-        resp = requests.post(
-            "https://api.openai.com/v1/responses",
-            headers=headers,
-            data=json.dumps(payload),
-            timeout=20,
+        # Build the input with system + user
+        # Using Responses API (stateful, supports file_search)
+        response = client.responses.create(
+            model="gpt-4o-mini",  # or gpt-4o if you prefer
+            instructions=SYSTEM_INSTRUCTIONS,
+            input=[
+                {
+                    "role": "user",
+                    "content": user_message,
+                }
+            ],
+            tools=[{"type": "file_search"}],
+            tool_resources={
+                "file_search": {
+                    "vector_store_ids": [VECTOR_STORE_ID]
+                }
+            },
+            previous_response_id=previous_response_id,
+            max_output_tokens=800,
         )
-        resp.raise_for_status()
+
+        # Simplest way to get the final text
+        # Most guides: response.output[0].content[0].text or response.output_text
+        answer_text = getattr(response, "output_text", None)
+        if not answer_text:
+            # Fallback: dig into output list
+            try:
+                answer_text = response.output[0].content[0].text
+            except Exception:
+                logging.warning("Could not parse output_text from response")
+                answer_text = ""
+
+        if not answer_text:
+            # Very defensive fallback
+            return (
+                "I’m not seeing enough information in my documents to answer that. "
+                "Please try rephrasing your question or ask to be connected to a representative."
+            )
+
+        return answer_text.strip()
+
     except Exception as e:
         logging.exception("Error calling OpenAI: %s", e)
         return (
-            "I’m having trouble getting Walter’s help right now. "
-            "Please check back a little later or ask a human for help."
+            "I ran into a problem trying to look that up. "
+            "Please try again in a moment or ask to be connected to a representative."
         )
 
-    try:
-        response_json = resp.json()
-        logging.info("Raw OpenAI response: %s", response_json)
-
-        # ORIGINAL-style parse: output[0].content[0].text.value
-        answer = response_json["output"][0]["content"][0]["text"]["value"]
-        answer = (answer or "").strip()
-        if not answer:
-            raise ValueError("Empty answer from Walter")
-
-        return answer
-
-    except Exception as e:
-        logging.exception("Error parsing OpenAI response: %s", e)
-        return "Walter was not able to find an answer this time. Please try again."
-
-
+# -----------------------------------------------------------------------------
+# Flask endpoint for SalesIQ webhook
+# -----------------------------------------------------------------------------
 @app.route("/walter", methods=["POST"])
-def walter():
+def walter_endpoint():
     """
-    Main endpoint: accept a JSON payload from Zoho
-    and return Walter's answer as JSON.
-    Shape: { "answer": "..." } to match your old mapping.
+    Expected JSON from SalesIQ webhook block:
+    {
+        "user_message": "text from visitor",
+        "previous_response_id": "optional OpenAI response id"  (we can extend later)
+    }
+
+    Returns JSON:
+    {
+        "success": true,
+        "answer": "Walter's reply text"
+    }
     """
+    data = request.get_json(silent=True) or {}
 
-    # Use silent=True so bad/empty JSON never throws
-    payload = request.get_json(silent=True) or {}
-    logging.info("Incoming payload: %s", payload)
+    user_message = (data.get("user_message") or "").strip()
+    previous_response_id = data.get("previous_response_id")
 
-    question = extract_question(payload)
-
-    if not question:
-        logging.info("No question found in request; returning fallback answer.")
-        msg = (
-            "I didn't receive a question to answer. "
-            "Please type your question in and try again."
-        )
-        return jsonify({"answer": msg})
-
-    logging.info("Question extracted: %s", question)
-
-    try:
-        answer = call_openai_walter(question)
-    except Exception as e:
-        logging.exception("Unexpected error getting Walter answer: %s", e)
-        answer = (
-            "I’m sorry, I ran into a problem talking to Walter. "
-            "Please connect with a human so we can help you."
+    if not user_message:
+        return jsonify(
+            {
+                "success": False,
+                "answer": "I didn’t catch that. What would you like help with?",
+            }
         )
 
-    return jsonify({"answer": answer})
+    answer = ask_walter(user_message, previous_response_id)
 
+    return jsonify(
+        {
+            "success": True,
+            "answer": answer,
+            # you can also send back previous_response_id=response.id later
+        }
+    )
 
 if __name__ == "__main__":
-    # 🔑 IMPORTANT: listen on the port Railway provides
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    # e.g. python app.py
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
