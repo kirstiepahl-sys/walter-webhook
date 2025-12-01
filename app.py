@@ -10,14 +10,13 @@ from openai import OpenAI
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# OpenAI client
 client = OpenAI()
 
-# Assistant ID for Walter (set this in your environment or hard-code)
+# Assistant ID for Walter (set as environment variable or hard-code)
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "asst_your_walter_id_here")
 
-# In-memory thread store: maps a SalesIQ conversation/chat id to an OpenAI thread id.
-# If you scale this beyond a single process, move this to Redis or a database.
+# In-memory thread store: maps a SalesIQ conversation id to an OpenAI thread id.
+# For production, use Redis or a database instead.
 thread_store = {}
 
 # ---------------------------------------------------------------------
@@ -28,23 +27,33 @@ thread_store = {}
 REMINDER_SYSTEM_MESSAGE = """
 Follow your system instructions exactly.
 
-For ANY wiring diagram request:
-- Treat it as a wiring-diagram workflow.
-- You must collect vehicle year, make, model, and ignition type if they are not already known.
-- You are ONLY allowed to use the document named "Master Wiring Diagrams with Links" to locate wiring diagrams.
-- Do NOT search or use any other manuals or documents for wiring diagrams.
-- Use the columns Vehicle Year, Vehicle Make, Vehicle Model, Vehicle Ignition Type, Diagram Name, and Link to Diagram to find the correct row.
-- If a match is found, respond with: "Here is the wiring diagram — click here." and hyperlink the word "here" to the URL.
-- If no match is found in that master document, route the user to Service Center Technical Support at 1-877-327-9130 option 2 or sctech@intoxalock.com.
+WIRING DIAGRAM REQUESTS:
+- If the user has NOT already given vehicle year, make, model, AND ignition type:
+  - Do NOT search any documents yet.
+  - Do NOT look in "Master Wiring Diagrams with Links" yet.
+  - Your ONLY response should be a clarifying question asking for the missing details.
+  - Do NOT list any wiring diagrams.
+  - Do NOT mention any document names.
 
-Never begin wiring responses with phrases like:
-- "I found information related to wiring diagrams in the manual..."
-- "The manual says..."
+- Only AFTER you know year, make, model, AND ignition type:
+  - Search ONLY the document named "Master Wiring Diagrams with Links".
+  - Use the columns Vehicle Year, Vehicle Make, Vehicle Model, Vehicle Ignition Type,
+    Diagram Name, and Link to Diagram to find the single best matching row.
+  - If a match is found, respond with: "Here is the wiring diagram — click here."
+    and hyperlink the word "here" to the URL.
+  - Do NOT list multiple diagrams.
+  - Do NOT mention the document name.
+  - Do NOT say "I found information in the document" or similar.
 
-You may still use other documents for NON-wiring questions, but wiring questions must always follow the master-document workflow.
+- If no match is found in that master document:
+  - Route the user to Service Center Technical Support at 1-877-327-9130 option 2
+    or sctech@intoxalock.com.
+  - Then apply your live-representative logic as defined in your system instructions.
 
-Also remember:
-- Apply routing rules and live-representative logic as defined in your system instructions.
+GENERAL:
+- You may use other documents for NON-wiring questions.
+- Never start a wiring answer by listing many different diagrams.
+- Never start with phrases like "I found information related to wiring diagrams...".
 """
 
 # ---------------------------------------------------------------------
@@ -107,11 +116,15 @@ def salesiq_webhook():
     thread_id = get_or_create_thread_id(conversation_id)
 
     # Add the user's message to the thread
-    client.beta.threads.messages.create(
-        thread_id=thread_id,
-        role="user",
-        content=user_message,
-    )
+    try:
+        client.beta.threads.messages.create(
+            thread_id=thread_id,
+            role="user",
+            content=user_message,
+        )
+    except Exception as e:
+        logging.exception("Error while adding user message to thread")
+        return jsonify({"answer": "I ran into an issue receiving your message. Please try again."})
 
     # Run Walter on this thread, with the reminder instructions merged in
     try:
@@ -131,7 +144,7 @@ def salesiq_webhook():
     try:
         messages = client.beta.threads.messages.list(
             thread_id=thread_id,
-            limit=5  # small window; newest messages are returned first
+            limit=5  # newest messages are first
         )
     except Exception as e:
         logging.exception("Error while listing messages")
@@ -141,10 +154,9 @@ def salesiq_webhook():
 
     answer_text = ""
 
-    # messages.data is usually ordered newest-first for beta.threads.messages.list
+    # Pick the newest assistant message with text content
     for msg in messages.data:
         if msg.role == "assistant":
-            # Each message can have multiple content parts; we only care about text
             for part in msg.content:
                 if part.type == "text":
                     answer_text = part.text.value
@@ -173,10 +185,8 @@ def health_check():
 # Entry point
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    # Use environment variables or defaults for host/port as needed
     host = os.environ.get("FLASK_HOST", "0.0.0.0")
     port = int(os.environ.get("FLASK_PORT", "5000"))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
 
     app.run(host=host, port=port, debug=debug)
-
