@@ -22,29 +22,34 @@ thread_store = {}
 # ---------------------------------------------------------------------
 # Per-request "nudger" instructions
 # ---------------------------------------------------------------------
-# These get merged into Walter's existing system instructions on EVERY run,
-# so he stays on-script even in long conversations.
 REMINDER_SYSTEM_MESSAGE = """
 Follow your system instructions exactly.
 
 WIRING DIAGRAM REQUESTS:
 
 - Treat EVERY wiring diagram request as a NEW request.
-- Ignore any vehicle information that may have been mentioned earlier in the thread
-  unless the user's CURRENT message (and your immediate clarifying follow-up) explicitly
-  contains all four of: vehicle year, make, model, and ignition type.
 
-- If the user's CURRENT wiring-related message does NOT clearly include vehicle year,
-  make, model, AND ignition type:
-    - Do NOT search any documents.
+- COMPLETELY IGNORE any vehicle information that:
+    - Was mentioned earlier in the thread,
+    - Appears in any conversation history,
+    - Appears in metadata, context, or transcript fields from SalesIQ or other systems,
+    - Was not explicitly provided by the user in their CURRENT message or their direct clarifying answer.
+
+- If the user's CURRENT wiring-related message does NOT clearly include:
+    - vehicle year,
+    - vehicle make,
+    - vehicle model,
+    - AND ignition type,
+
+  THEN:
+    - Do NOT search ANY documents.
     - Do NOT look in "Master Wiring Diagrams with Links".
     - Do NOT use cached or previous vehicle information.
     - Your ONLY response must be a clarifying question asking for the missing details.
     - Do NOT list any wiring diagrams.
     - Do NOT mention any document names.
 
-- Only AFTER you have all four fields (from the user's current message and their
-  direct answer to your clarifying question):
+- Only AFTER you have all four fields (from the user's current message and their direct clarifying answer):
     - Search ONLY the document named "Master Wiring Diagrams with Links".
     - Use the columns Vehicle Year, Vehicle Make, Vehicle Model, Vehicle Ignition Type,
       Diagram Name, and Link to Diagram to find the single best matching row.
@@ -101,13 +106,20 @@ def salesiq_webhook():
     data = request.get_json(force=True) or {}
     logging.info(f"Incoming payload: {data}")
 
-    # Try common key names for the user message
-    user_message = (
+    # Extract ONLY the newest user message and ignore any history/context fields
+    raw_message = (
         data.get("question")
         or data.get("message")
         or data.get("text")
         or ""
     )
+
+    # Explicitly ignore common history/context keys from SalesIQ or other systems
+    for key in ["history", "context", "past", "previous", "transcript"]:
+        if key in data:
+            logging.info(f"Ignoring SalesIQ field '{key}' for message content.")
+
+    user_message = raw_message.strip()
 
     # Try common key names for a conversation identifier
     conversation_id = (
@@ -117,12 +129,12 @@ def salesiq_webhook():
         or "default_conversation"
     )
 
-    if not user_message.strip():
+    if not user_message:
         logging.warning("No user message found in payload.")
         return jsonify({"answer": "I didn’t receive a question to answer."})
 
-    # Optional: if the user explicitly types "restart", reset the thread
-    if user_message.strip().lower() in ["restart", "start over", "new chat", "reset"]:
+    # Optional: if the user explicitly types a reset keyword, drop the thread
+    if user_message.lower() in ["restart", "start over", "new chat", "reset"]:
         if conversation_id in thread_store:
             del thread_store[conversation_id]
             logging.info(f"Reset thread for conversation {conversation_id}")
