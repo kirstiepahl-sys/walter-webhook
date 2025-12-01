@@ -16,7 +16,7 @@ client = OpenAI()
 ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "asst_your_walter_id_here")
 
 # In-memory thread store: maps a SalesIQ conversation id to an OpenAI thread id.
-# For production, use Redis or a database instead.
+# For production, move this to Redis or a database.
 thread_store = {}
 
 # ---------------------------------------------------------------------
@@ -28,27 +28,36 @@ REMINDER_SYSTEM_MESSAGE = """
 Follow your system instructions exactly.
 
 WIRING DIAGRAM REQUESTS:
-- If the user has NOT already given vehicle year, make, model, AND ignition type:
-  - Do NOT search any documents yet.
-  - Do NOT look in "Master Wiring Diagrams with Links" yet.
-  - Your ONLY response should be a clarifying question asking for the missing details.
-  - Do NOT list any wiring diagrams.
-  - Do NOT mention any document names.
 
-- Only AFTER you know year, make, model, AND ignition type:
-  - Search ONLY the document named "Master Wiring Diagrams with Links".
-  - Use the columns Vehicle Year, Vehicle Make, Vehicle Model, Vehicle Ignition Type,
-    Diagram Name, and Link to Diagram to find the single best matching row.
-  - If a match is found, respond with: "Here is the wiring diagram — click here."
-    and hyperlink the word "here" to the URL.
-  - Do NOT list multiple diagrams.
-  - Do NOT mention the document name.
-  - Do NOT say "I found information in the document" or similar.
+- Treat EVERY wiring diagram request as a NEW request.
+- Ignore any vehicle information that may have been mentioned earlier in the thread
+  unless the user's CURRENT message (and your immediate clarifying follow-up) explicitly
+  contains all four of: vehicle year, make, model, and ignition type.
+
+- If the user's CURRENT wiring-related message does NOT clearly include vehicle year,
+  make, model, AND ignition type:
+    - Do NOT search any documents.
+    - Do NOT look in "Master Wiring Diagrams with Links".
+    - Do NOT use cached or previous vehicle information.
+    - Your ONLY response must be a clarifying question asking for the missing details.
+    - Do NOT list any wiring diagrams.
+    - Do NOT mention any document names.
+
+- Only AFTER you have all four fields (from the user's current message and their
+  direct answer to your clarifying question):
+    - Search ONLY the document named "Master Wiring Diagrams with Links".
+    - Use the columns Vehicle Year, Vehicle Make, Vehicle Model, Vehicle Ignition Type,
+      Diagram Name, and Link to Diagram to find the single best matching row.
+    - If a match is found, respond with: "Here is the wiring diagram — click here."
+      and hyperlink the word "here" to the URL.
+    - Do NOT list multiple diagrams.
+    - Do NOT mention the document name.
+    - Do NOT say "I found information in the document" or similar.
 
 - If no match is found in that master document:
-  - Route the user to Service Center Technical Support at 1-877-327-9130 option 2
-    or sctech@intoxalock.com.
-  - Then apply your live-representative logic as defined in your system instructions.
+    - Route the user to Service Center Technical Support at 1-877-327-9130 option 2
+      or sctech@intoxalock.com.
+    - Then apply your live-representative logic as defined in your system instructions.
 
 GENERAL:
 - You may use other documents for NON-wiring questions.
@@ -112,6 +121,13 @@ def salesiq_webhook():
         logging.warning("No user message found in payload.")
         return jsonify({"answer": "I didn’t receive a question to answer."})
 
+    # Optional: if the user explicitly types "restart", reset the thread
+    if user_message.strip().lower() in ["restart", "start over", "new chat", "reset"]:
+        if conversation_id in thread_store:
+            del thread_store[conversation_id]
+            logging.info(f"Reset thread for conversation {conversation_id}")
+        return jsonify({"answer": "Let’s start fresh. How can we help you today?"})
+
     # Get or create a thread for this conversation
     thread_id = get_or_create_thread_id(conversation_id)
 
@@ -122,7 +138,7 @@ def salesiq_webhook():
             role="user",
             content=user_message,
         )
-    except Exception as e:
+    except Exception:
         logging.exception("Error while adding user message to thread")
         return jsonify({"answer": "I ran into an issue receiving your message. Please try again."})
 
@@ -134,7 +150,7 @@ def salesiq_webhook():
             instructions=REMINDER_SYSTEM_MESSAGE,
             temperature=0.2,
         )
-    except Exception as e:
+    except Exception:
         logging.exception("Error while creating/polling run")
         return jsonify({
             "answer": "I ran into an issue while processing your request. Please try again or contact support directly."
@@ -146,7 +162,7 @@ def salesiq_webhook():
             thread_id=thread_id,
             limit=5  # newest messages are first
         )
-    except Exception as e:
+    except Exception:
         logging.exception("Error while listing messages")
         return jsonify({
             "answer": "I wasn’t able to retrieve a response just now. Please try again or contact support directly."
