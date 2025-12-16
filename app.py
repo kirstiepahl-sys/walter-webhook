@@ -1,220 +1,286 @@
 import os
-import logging
+import re
+import time
+import json
+from typing import Any, Dict, Optional, Tuple
+
+import requests
 from flask import Flask, request, jsonify
+from zoneinfo import ZoneInfo
+from datetime import datetime
+
 from openai import OpenAI
 
-# ---------------------------------------------------------------------
-# Basic setup
-# ---------------------------------------------------------------------
+# -----------------------------
+# CONFIG
+# -----------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_ASSISTANT_ID = os.getenv("OPENAI_ASSISTANT_ID", "")  # Walter assistant id
+
+# Zoho Creator Custom API
+CREATOR_BASE_URL = os.getenv(
+    "CREATOR_BASE_URL",
+    "https://www.zohoapis.com/creator/custom/kpcreator/lookup_wiring_diagram",
+)
+CREATOR_PUBLIC_KEY = os.getenv("CREATOR_PUBLIC_KEY", "")  # K9wQnhpZdEaNtgey9Ma7K87Ey
+
+# Timezone for business hours logic in your system instructions
+CST_TZ = ZoneInfo("America/Chicago")
+
+# Polling settings for Assistants run
+RUN_POLL_SECONDS = float(os.getenv("RUN_POLL_SECONDS", "0.6"))
+RUN_MAX_WAIT_SECONDS = float(os.getenv("RUN_MAX_WAIT_SECONDS", "12"))
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-client = OpenAI()
 
-# Assistant ID for Walter (set as environment variable or hard-code)
-ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID", "asst_your_walter_id_here")
+# -----------------------------
+# Helpers
+# -----------------------------
+WIRING_KEYWORDS = [
+    "wiring diagram", "wiring", "wire colors", "wire colour", "wire info",
+    "install wiring", "starter wire", "ignition wire", "relay", "diagram"
+]
 
-# In-memory thread store: maps a SalesIQ conversation id to an OpenAI thread id.
-# For production, move this to Redis or a database.
-thread_store = {}
+# Lightweight make list for extraction (extend anytime)
+KNOWN_MAKES = [
+    "acura","alfa romeo","audi","bmw","buick","cadillac","chevrolet","chrysler",
+    "dodge","ford","gmc","honda","hyundai","infiniti","jaguar","jeep","kia",
+    "land rover","lexus","lincoln","mazda","mercedes","mini","mitsubishi",
+    "nissan","porsche","ram","subaru","tesla","toyota","volkswagen","volvo"
+]
 
-# ---------------------------------------------------------------------
-# Per-request "nudger" instructions
-# ---------------------------------------------------------------------
-REMINDER_SYSTEM_MESSAGE = """
-Follow your system instructions exactly.
+def is_wiring_request(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in WIRING_KEYWORDS)
 
-WIRING DIAGRAM REQUESTS:
-
-- Treat EVERY wiring diagram request as a NEW request.
-
-- COMPLETELY IGNORE any vehicle information that:
-    - Was mentioned earlier in the thread,
-    - Appears in any conversation history,
-    - Appears in metadata, context, or transcript fields from SalesIQ or other systems,
-    - Was not explicitly provided by the user in their CURRENT message or their direct clarifying answer.
-
-- If the user's CURRENT wiring-related message does NOT clearly include:
-    - vehicle year,
-    - vehicle make,
-    - vehicle model,
-    - AND ignition type,
-
-  THEN:
-    - Do NOT search ANY documents.
-    - Do NOT look in "Master Wiring Diagrams with Links".
-    - Do NOT use cached or previous vehicle information.
-    - Your ONLY response must be a clarifying question asking for the missing details.
-    - Do NOT list any wiring diagrams.
-    - Do NOT mention any document names.
-
-- Only AFTER you have all four fields (from the user's current message and their direct clarifying answer):
-    - Search ONLY the document named "Master Wiring Diagrams with Links".
-    - Use the columns Vehicle Year, Vehicle Make, Vehicle Model, Vehicle Ignition Type,
-      Diagram Name, and Link to Diagram to find the single best matching row.
-    - If a match is found, respond with: "Here is the wiring diagram — click here."
-      and hyperlink the word "here" to the URL.
-    - Do NOT list multiple diagrams.
-    - Do NOT mention the document name.
-    - Do NOT say "I found information in the document" or similar.
-
-- If no match is found in that master document:
-    - Route the user to Service Center Technical Support at 1-877-327-9130 option 2
-      or sctech@intoxalock.com.
-    - Then apply your live-representative logic as defined in your system instructions.
-
-GENERAL:
-- You may use other documents for NON-wiring questions.
-- Never start a wiring answer by listing many different diagrams.
-- Never start with phrases like "I found information related to wiring diagrams...".
-"""
-
-# ---------------------------------------------------------------------
-# Helper: get or create a thread for a conversation
-# ---------------------------------------------------------------------
-def get_or_create_thread_id(conversation_id: str) -> str:
+def extract_year_make_model_ignition(text: str) -> Dict[str, Optional[str]]:
     """
-    Get an existing OpenAI thread id for this conversation_id, or create a new one.
+    Non-assumptive extraction:
+    - year: first 4-digit year 19xx/20xx
+    - make: first known make found
+    - model: best-effort remaining token(s) after make, stripped of ignition phrases
+    - ignition: if explicit (push-to-start / smart key / standard key)
     """
-    thread_id = thread_store.get(conversation_id)
-    if thread_id:
-        return thread_id
+    raw = (text or "").strip()
+    low = raw.lower()
+
+    # Year
+    year = None
+    m_year = re.search(r"\b(19\d{2}|20\d{2})\b", low)
+    if m_year:
+        year = m_year.group(1)
+
+    # Ignition
+    ignition = None
+    if re.search(r"\b(push[\s-]?to[\s-]?start|push[\s-]?button|smart[\s-]?key|proximity)\b", low):
+        ignition = "Push to Start"
+    elif re.search(r"\b(standard[\s-]?key|regular[\s-]?key|key[\s-]?start|turn[\s-]?key)\b", low):
+        ignition = "Standard Key"
+
+    # Make
+    make = None
+    found_make = None
+    for mk in sorted(KNOWN_MAKES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(mk)}\b", low):
+            found_make = mk
+            break
+    if found_make:
+        make = found_make.upper() if len(found_make) <= 4 else found_make.title()
+
+    # Model (best effort)
+    model = None
+    if year and make:
+        # remove year and make from text, then remove common ignition phrases
+        tmp = re.sub(rf"\b{re.escape(year)}\b", " ", low)
+        tmp = re.sub(rf"\b{re.escape(found_make)}\b", " ", tmp)
+        tmp = re.sub(r"\b(wiring|diagram|wire|colors|colour|info|install|please|need|for|a|an|the)\b", " ", tmp)
+        tmp = re.sub(r"\b(push[\s-]?to[\s-]?start|push[\s-]?button|smart[\s-]?key|proximity|standard[\s-]?key|regular[\s-]?key|key[\s-]?start|turn[\s-]?key)\b", " ", tmp)
+        # collapse whitespace
+        tmp = re.sub(r"\s+", " ", tmp).strip()
+        # take first "chunk" as model; allow hyphens/letters/numbers/spaces
+        if tmp:
+            # Model often includes things like "f-150", "330e", "silverado 2500"
+            model = tmp.upper() if tmp.isupper() else tmp
+    elif year and not make:
+        # user might say "2018 Camry" -> model only present
+        tmp = re.sub(rf"\b{re.escape(year)}\b", " ", low)
+        tmp = re.sub(r"\b(wiring|diagram|wire|colors|colour|info|install|please|need|for|a|an|the)\b", " ", tmp)
+        tmp = re.sub(r"\s+", " ", tmp).strip()
+        if tmp:
+            model = tmp.upper() if tmp.isupper() else tmp
+
+    return {
+        "year": year,
+        "make": make,
+        "model": model,
+        "ignition": ignition
+    }
+
+def current_time_cst_iso() -> str:
+    return datetime.now(tz=CST_TZ).isoformat()
+
+def creator_lookup(year: str, make: str, model: str, ignition: Optional[str]) -> Dict[str, Any]:
+    """
+    Calls your Zoho Creator Custom API (Public Key auth).
+    Returns parsed JSON or a safe fallback structure.
+    """
+    params = {
+        "publickey": CREATOR_PUBLIC_KEY,
+        "year": year,
+        "make": make,
+        "model": model,
+    }
+    if ignition:
+        params["ignition"] = ignition
+
+    try:
+        r = requests.get(CREATOR_BASE_URL, params=params, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        # Safe fallback
+        return {
+            "code": 5000,
+            "result": {
+                "count": 0,
+                "matches": [],
+                "error": str(e),
+            }
+        }
+
+def build_injected_context(user_text: str) -> str:
+    """
+    Creates a strict 'context block' that we prepend to the user's message
+    so Walter has the wiring matches without "searching documents."
+    """
+    ct = current_time_cst_iso()
+    info = extract_year_make_model_ignition(user_text)
+
+    # If not a wiring request, we don't inject lookup context
+    if not is_wiring_request(user_text):
+        return f"current_time_cst: {ct}\n\nUSER_MESSAGE:\n{user_text}"
+
+    # If wiring request but missing year/make/model, do NOT call Creator
+    year, make, model = info.get("year"), info.get("make"), info.get("model")
+    ignition = info.get("ignition")
+
+    if not year or not make or not model:
+        # still provide parsed fields so Walter can ask only what's missing
+        return (
+            f"current_time_cst: {ct}\n"
+            f"wiring_request: true\n"
+            f"parsed_year: {year or ''}\n"
+            f"parsed_make: {make or ''}\n"
+            f"parsed_model: {model or ''}\n"
+            f"parsed_ignition: {ignition or ''}\n\n"
+            f"wiring_lookup_result: null\n\n"
+            f"USER_MESSAGE:\n{user_text}"
+        )
+
+    # Call Creator
+    lookup = creator_lookup(year, make, model, ignition)
+
+    return (
+        f"current_time_cst: {ct}\n"
+        f"wiring_request: true\n"
+        f"parsed_year: {year}\n"
+        f"parsed_make: {make}\n"
+        f"parsed_model: {model}\n"
+        f"parsed_ignition: {ignition or ''}\n\n"
+        f"wiring_lookup_result (json):\n{json.dumps(lookup, ensure_ascii=False)}\n\n"
+        f"USER_MESSAGE:\n{user_text}"
+    )
+
+def run_walter(message_text: str) -> str:
+    """
+    Creates a new thread per message (treat every message as new),
+    sends injected context + user message, runs Walter, returns output.
+    """
+    if not OPENAI_API_KEY or not OPENAI_ASSISTANT_ID:
+        return "Configuration error: missing OPENAI_API_KEY or OPENAI_ASSISTANT_ID."
 
     thread = client.beta.threads.create()
-    thread_id = thread.id
-    thread_store[conversation_id] = thread_id
-    logging.info(f"Created new thread {thread_id} for conversation {conversation_id}")
-    return thread_id
+    client.beta.threads.messages.create(
+        thread_id=thread.id,
+        role="user",
+        content=message_text
+    )
+
+    run = client.beta.threads.runs.create(
+        thread_id=thread.id,
+        assistant_id=OPENAI_ASSISTANT_ID
+    )
+
+    # Poll
+    start = time.time()
+    while True:
+        r = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
+        if r.status in ("completed", "failed", "cancelled", "expired"):
+            break
+        if time.time() - start > RUN_MAX_WAIT_SECONDS:
+            return "We’re sorry—something took too long. Please try again."
+        time.sleep(RUN_POLL_SECONDS)
+
+    if r.status != "completed":
+        return "We’re sorry—something went wrong. Please try again."
+
+    # Get last assistant message
+    msgs = client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=10)
+    for m in msgs.data:
+        if m.role == "assistant":
+            # message content blocks
+            parts = []
+            for c in m.content:
+                if c.type == "text":
+                    parts.append(c.text.value)
+            text_out = "\n".join(parts).strip()
+            return text_out or "How can we assist you today?"
+    return "How can we assist you today?"
 
 
-# ---------------------------------------------------------------------
-# SalesIQ webhook endpoint
-# ---------------------------------------------------------------------
-@app.route("/salesiq-webhook", methods=["POST"])
+# -----------------------------
+# Routes
+# -----------------------------
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+@app.post("/salesiq")
 def salesiq_webhook():
     """
-    Main webhook endpoint that SalesIQ calls.
-
-    Expects JSON that includes at least:
-    - question/message text
-    - some conversation or chat id
-
-    Adjust the keys below (question / message / conversation_id / chat_id / visitor_id)
-    to match your actual SalesIQ payload if needed.
+    SalesIQ webhook payloads vary by channel/flow.
+    We'll try multiple keys to find the user's message.
     """
-    data = request.get_json(force=True) or {}
-    logging.info(f"Incoming payload: {data}")
+    payload = request.get_json(silent=True) or {}
 
-    # Extract ONLY the newest user message and ignore any history/context fields
-    raw_message = (
-        data.get("question")
-        or data.get("message")
-        or data.get("text")
+    # Common candidate fields
+    user_text = (
+        payload.get("message")
+        or payload.get("text")
+        or payload.get("visitor_message")
+        or payload.get("question")
+        or payload.get("query")
         or ""
     )
 
-    # Explicitly ignore common history/context keys from SalesIQ or other systems
-    for key in ["history", "context", "past", "previous", "transcript"]:
-        if key in data:
-            logging.info(f"Ignoring SalesIQ field '{key}' for message content.")
+    # Some payloads nest it
+    if not user_text and isinstance(payload.get("data"), dict):
+        user_text = payload["data"].get("message") or payload["data"].get("text") or ""
 
-    user_message = raw_message.strip()
+    user_text = (user_text or "").strip()
+    if not user_text:
+        return jsonify({"reply": "How can we assist you today?"})
 
-    # Try common key names for a conversation identifier
-    conversation_id = (
-        data.get("conversation_id")
-        or data.get("chat_id")
-        or data.get("visitor_id")
-        or "default_conversation"
-    )
+    injected = build_injected_context(user_text)
+    answer = run_walter(injected)
 
-    if not user_message:
-        logging.warning("No user message found in payload.")
-        return jsonify({"answer": "I didn’t receive a question to answer."})
-
-    # Optional: if the user explicitly types a reset keyword, drop the thread
-    if user_message.lower() in ["restart", "start over", "new chat", "reset"]:
-        if conversation_id in thread_store:
-            del thread_store[conversation_id]
-            logging.info(f"Reset thread for conversation {conversation_id}")
-        return jsonify({"answer": "Let’s start fresh. How can we help you today?"})
-
-    # Get or create a thread for this conversation
-    thread_id = get_or_create_thread_id(conversation_id)
-
-    # Add the user's message to the thread
-    try:
-        client.beta.threads.messages.create(
-            thread_id=thread_id,
-            role="user",
-            content=user_message,
-        )
-    except Exception:
-        logging.exception("Error while adding user message to thread")
-        return jsonify({"answer": "I ran into an issue receiving your message. Please try again."})
-
-    # Run Walter on this thread, with the reminder instructions merged in
-    try:
-        run = client.beta.threads.runs.create_and_poll(
-            thread_id=thread_id,
-            assistant_id=ASSISTANT_ID,
-            instructions=REMINDER_SYSTEM_MESSAGE,
-            temperature=0.2,
-        )
-    except Exception:
-        logging.exception("Error while creating/polling run")
-        return jsonify({
-            "answer": "I ran into an issue while processing your request. Please try again or contact support directly."
-        })
-
-    # Fetch the latest assistant message from the thread
-    try:
-        messages = client.beta.threads.messages.list(
-            thread_id=thread_id,
-            limit=5  # newest messages are first
-        )
-    except Exception:
-        logging.exception("Error while listing messages")
-        return jsonify({
-            "answer": "I wasn’t able to retrieve a response just now. Please try again or contact support directly."
-        })
-
-    answer_text = ""
-
-    # Pick the newest assistant message with text content
-    for msg in messages.data:
-        if msg.role == "assistant":
-            for part in msg.content:
-                if part.type == "text":
-                    answer_text = part.text.value
-                    break
-            if answer_text:
-                break
-
-    if not answer_text:
-        logging.warning("No assistant answer found in thread messages.")
-        answer_text = "I’m sorry, I wasn’t able to generate a response just now."
-
-    # Return the answer to SalesIQ.
-    # Adjust the key ("answer") if your integration expects a different field name.
-    return jsonify({"answer": answer_text})
+    # Return format: keep it simple. Adjust if SalesIQ expects a specific key.
+    return jsonify({"reply": answer})
 
 
-# ---------------------------------------------------------------------
-# Basic health check
-# ---------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def health_check():
-    return "Walter webhook is running", 200
-
-
-# ---------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    host = os.environ.get("FLASK_HOST", "0.0.0.0")
-    port = int(os.environ.get("FLASK_PORT", "5000"))
-    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
-
-    app.run(host=host, port=port, debug=debug)
+    # Railway uses PORT
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
