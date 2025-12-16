@@ -249,35 +249,37 @@ def health():
 
 @app.post("/salesiq")
 def salesiq_webhook():
-    """
-    SalesIQ webhook payloads vary by channel/flow.
-    We'll try multiple keys to find the user's message.
-    """
     payload = request.get_json(silent=True) or {}
 
-    # Common candidate fields
+    visitor = payload.get("visitor", {}) if isinstance(payload.get("visitor"), dict) else {}
+
+    # Prefer SalesIQ Text Input variable first
     user_text = (
-        payload.get("message")
+        visitor.get("question")
+        or payload.get("visitor_question")
+        or payload.get("question")
+        or payload.get("message")
         or payload.get("text")
         or payload.get("visitor_message")
-        or payload.get("question")
         or payload.get("query")
         or ""
     )
 
     # Some payloads nest it
     if not user_text and isinstance(payload.get("data"), dict):
-        user_text = payload["data"].get("message") or payload["data"].get("text") or ""
+        data = payload.get("data", {})
+        user_text = data.get("visitor", {}).get("question") or data.get("message") or data.get("text") or ""
 
     user_text = (user_text or "").strip()
     if not user_text:
-        return jsonify({"reply": "How can we assist you today?"})
+        return jsonify({"walter_reply": "How can we assist you today?"})
 
     injected = build_injected_context(user_text)
     answer = run_walter(injected)
 
-    # Return format: keep it simple. Adjust if SalesIQ expects a specific key.
-    return jsonify({"reply": answer})
+    # IMPORTANT: must match your Send Message variable name
+    return jsonify({"walter_reply": answer})
+
 
 
 if __name__ == "__main__":
